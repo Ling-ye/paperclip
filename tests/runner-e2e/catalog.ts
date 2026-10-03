@@ -1,4 +1,5 @@
 import { chatConfirmationTasks } from "./chat-cases.js";
+import { hiringTemplateTasks, hiringTemplateProfile, hiringTemplateDefinitionDigest } from "./hiring-template-cases.js";
 import { instructionPersistenceTask } from "./instruction-persistence.js";
 import { apiResponseReadingTask } from "./api-response-reading.js";
 import { taskTitleTasks, taskTitleDefinitionDigest, TASK_TITLE_BUDGET_CENTS } from "./task-titles.js";
@@ -1238,6 +1239,16 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     excludedExecutionIds: ["runner-codex", "runner-acpx-claude"].flatMap(profile =>
       ["stop-startup-new-resume", "hire-delegate-reuse", "blocked-status-review"].map(task => `agent-chat-hardening.${profile}.daytona.${task}`)),
     definitionMetadata: { version: 5, permissions: "production-defaults", instructions: "production", grading: "durable-state-and-source-evidence", scheduling: "explicit-only", restartMemory: "required-after-restart", statusEvidence: "structured-current-blocker-and-active-run-count", readOnlyState: "public-mutation-contract-and-relations", hiringReference: "neutral-document-reference-line" },
+  },
+  {
+    id: "hiring-templates", label: "Production Hiring Templates", manualOnly: true,
+    description: "Production CEO and hiring skill/reference discovery, one coder hire, independently checked JSON artifacts and worker reuse.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => hiringTemplateProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment], tasks: hiringTemplateTasks, expectedMatrixSize: 2,
+    definitionMetadata: { version: 1, definitionDigest: hiringTemplateDefinitionDigest, instructions: "source-revision-default-ceo", scheduling: "explicit-only",
+      grading: "independent-json-and-read-receipts", baselineComparison: "same-fixture-source-derived-bundles", providerTurns: 5 },
   },
   {
     id: "agent-chat-stories", label: "Agent Chat Setup and Interruptions", manualOnly: true,

@@ -1,4 +1,5 @@
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
+import { boundedMcpToolName } from "./mcp-tool-names.js";
 import { browserUseService } from "./browser-use.js";
 import { isBrowserUseConnection } from "./browser-use-client.js";
 import { COGNEE_STDIO_TEMPLATE, cogneeCloudUrl, callCogneeCloud } from "./cognee-connection.js";
@@ -1384,10 +1385,14 @@ export function createToolGatewayService(
           );
         }
         const baseName = baseNames[index]!;
-        const gatewayToolName =
+        const unboundedGatewayToolName =
           baseNameCounts.get(baseName)! > 1
             ? `${baseName}-${shortStableId(catalogEntry.id)}`
             : baseName;
+        const gatewayToolName = boundedMcpToolName(unboundedGatewayToolName, [
+          connection.id, application.id, catalogEntry.toolName,
+          ...(baseNameCounts.get(baseName)! > 1 ? [catalogEntry.id] : []),
+        ]);
         const applicationKey = application.applicationKey ?? null;
         const inputSchema = projectedConnectionToolInputSchema(
           connection,

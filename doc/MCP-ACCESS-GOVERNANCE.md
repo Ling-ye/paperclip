@@ -125,6 +125,13 @@ Paperclip plays two roles in the MCP graph, and confusing them is the most commo
 
 Operators usually mean *gateway* when they say "MCP access governance". For Paperclip-managed local adapter runs, Paperclip writes adapter MCP config that points at named gateway endpoints with short-lived scoped bearer tokens. Policies, approvals, and the audit log only exist for calls that enter gateway mode.
 
+Connected tool names reserve the `mcp__paperclip-assigned__` provider prefix
+within the 128-character limit. Short existing names stay compatible. Longer
+names use a readable prefix and a stable hash of the connection, application,
+and upstream tool identity; duplicate catalog entries also include their entry
+identity. Gateway metadata retains the original upstream name for dispatch,
+permissions, and audit. An alias never changes which connection executes a call.
+
 V1 does not claim host-wide MCP enforcement. If an unmanaged external client, hand-edited adapter config, or process outside the Paperclip-controlled workspace calls an upstream MCP server directly, Paperclip can warn about known overlapping config entries but cannot prevent or audit that bypass. Treat managed MCP config as a control-plane containment feature for Paperclip-launched agents, not as an endpoint firewall for the operator's whole machine.
 
 ## Managed connections

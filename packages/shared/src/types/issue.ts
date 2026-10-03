@@ -1516,6 +1516,8 @@ export interface IssueThreadInteractionBase extends IssueThreadInteractionActorF
   summary?: string | null;
   status: IssueThreadInteractionStatus;
   continuationPolicy: IssueThreadInteractionContinuationPolicy;
+  /** Read-time acceptance gate; omitted when no workspace preparation is pending. */
+  acceptanceBlocker?: "workspace_sync_pending";
   /** @deprecated Read requestedResolverPolicy. Kept for API compatibility. */
   resolverPolicy: IssueThreadInteractionCanonicalResolverPolicy;
   requestedResolverPolicy: IssueThreadInteractionCanonicalResolverPolicy;

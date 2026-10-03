@@ -13,6 +13,7 @@ import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent
 import { isAiConnectionCompatible } from "@paperclipai/shared";
 import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSkills, isConnectorSkill } from "../services/connector-runtime.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { canRetryStoppedRun } from "../services/cancelled-native-startup.js";
 import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaperclipRunnerProvider } from "@paperclipai/adapter-utils";
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { selectDashboardRunIds } from "../services/dashboard-run-selection.js";
@@ -5997,7 +5998,7 @@ export function agentRoutes(
           "An exact failed-run retry cannot override its execution context.",
         );
       }
-      const failedRun = await heartbeat.getRun(req.body.failedRunId);
+      const failedRun = await heartbeat.getRun(req.body.failedRunId, { includeExecutionEvidence: true });
       if (
         !failedRun ||
         failedRun.companyId !== agent.companyId ||
@@ -6005,19 +6006,23 @@ export function agentRoutes(
       ) {
         throw notFound("Failed run not found");
       }
-      if (!["failed", "timed_out"].includes(failedRun.status)) {
-        throw conflict("Only a failed run can be retried.");
-      }
       if (failedRun.runtimeMode === "native" && failedRun.errorCode === "native_session_cleanup_quarantined") {
         throw conflict("The stopped native session requires cleanup and reconciliation before a new attempt.", {
           code: "native_session_cleanup_quarantined",
         });
+      }
+      if (!(await canRetryStoppedRun(db, failedRun))) {
+        throw conflict("Only a failed run or a verified eligible cancellation can start a new attempt.");
       }
       const failedContext = asRecord(failedRun.contextSnapshot) ?? {};
       const issueId =
         typeof failedContext.issueId === "string"
           ? failedContext.issueId
           : null;
+      if (failedRun.status === "cancelled" && (!issueId ||
+          (await getExecutionBlocker(db, agent.companyId, issueId))?.runId !== failedRun.id)) {
+        throw conflict("The stopped run no longer owns this task's recovery hold.");
+      }
       if (issueId) {
         const issue = await issueService(db).getById(issueId);
         if (!issue || issue.companyId !== agent.companyId) throw notFound("Task not found");
@@ -6073,6 +6078,9 @@ export function agentRoutes(
             .then((rows) => rows[0])
         : null;
       if (chatBinding) {
+        if (failedRun.status === "cancelled") {
+          throw conflict("Send a new chat message to continue this stopped conversation.");
+        }
         if (!options.chatRunRetries || !req.actor.userId) {
           throw conflict("Chat retry authorization is unavailable.", {
             code: "chat_failed_run_retry_requires_authorized_context",
