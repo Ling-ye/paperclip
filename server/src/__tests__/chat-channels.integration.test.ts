@@ -16019,6 +16019,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       runtime: runtime as unknown as ChatSdkRuntime,
       scheduleDeferredWork: (task) => deferred.push(task),
     });
+    fixtureServices.add(service);
     const endpoint = await service.create(
       fixture.companyId,
       { provider: "slack", assignedAgentId: fixture.assignedAgentId },
@@ -16137,6 +16138,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       publicBaseUrl: "https://paperclip.example",
       runtime: new FakeChatSdkRuntime() as unknown as ChatSdkRuntime,
     });
+    fixtureServices.add(competingService);
     deferred.shift()?.();
     // Simulate another server process reconciling the same durable rows at
     // the same time as the webhook process's deferred drain.
@@ -16152,18 +16154,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .select()
       .from(chatConversations)
       .where(eq(chatConversations.endpointId, endpoint.id));
-    await vi.waitFor(async () => {
-      const rows = await db
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(eq(issueComments.issueId, conversation.issueId));
-      expect(rows).toHaveLength(8);
-    });
+    // The competing sweep can return after losing the conversation lease while
+    // the deferred owner is still admitting messages. Join that owner's work
+    // through the service drain before asserting the whole batch. This keeps
+    // the test's normal deadline and does not require eight turns to fit in
+    // vi.waitFor's default one-second polling window.
+    await service.shutdown();
+    await competingService.shutdown();
     const comments = await db
       .select({ id: issueComments.id, body: issueComments.body })
       .from(issueComments)
       .where(eq(issueComments.issueId, conversation.issueId))
       .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+    expect(comments).toHaveLength(8);
     expect(comments.map((comment) => comment.body)).toEqual([
       "@maya acknowledge quickly",
       "follow-up 3",
@@ -16174,32 +16177,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       "follow-up 7",
       "follow-up 8",
     ]);
-    // Comment admission commits before the durable wake. Wait for this
-    // company's last wake too, not merely its already-visible last comment.
-    // The competing sweep may legitimately reconcile another fixture company.
-    await vi.waitFor(() => {
-      const calls = wakeup.mock.calls.filter(
-        (call) => call[0] === fixture.assignedAgentId,
-      );
-      expect(calls).toHaveLength(8);
-      expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
-        comments.map((comment) => comment.id),
-      );
-    });
-    // The last comment and wakeup commit inside the lease. Under full-suite
-    // load the assertions above can observe those effects one microtask before
-    // the deferred owner's `finally` deletes its lease. Require prompt eventual
-    // release; a real leak would remain for the much longer lease TTL.
-    await vi.waitFor(async () => {
-      expect(
-        await db
-          .select()
-          .from(chatEndpointLeases)
-          .where(eq(chatEndpointLeases.endpointId, endpoint.id)),
-      ).toHaveLength(0);
-    });
-    await competingService.shutdown();
-    await service.shutdown();
+    // The drain includes wake receipts and lease release. The competing sweep
+    // may legitimately reconcile another fixture company, so scope the calls.
+    const calls = wakeup.mock.calls.filter(
+      (call) => call[0] === fixture.assignedAgentId,
+    );
+    expect(calls).toHaveLength(8);
+    expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
+      comments.map((comment) => comment.id),
+    );
+    expect(
+      await db
+        .select()
+        .from(chatEndpointLeases)
+        .where(eq(chatEndpointLeases.endpointId, endpoint.id)),
+    ).toHaveLength(0);
   });
 
   it("stops a conversation drain after its lease renewal fails", async () => {
