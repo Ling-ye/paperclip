@@ -16010,11 +16010,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const runtime = new FakeChatSdkRuntime();
     const deferred: Array<() => void> = [];
     const wakeup = vi.fn(async () => ({ accepted: true }));
+    let completeBatch!: () => void;
+    const batchReceipts = new Promise<void>((resolve) => { completeBatch = resolve; });
+    let receiptCount = 0;
+    const recordWakeup = receiptBackedWakeup(wakeup);
+    const observeWakeup: ChatChannelServiceOptions["heartbeat"]["wakeup"] = async (agentId, opts) => {
+      const result = await recordWakeup(agentId, opts);
+      if (agentId === fixture.assignedAgentId && ++receiptCount === 8) completeBatch();
+      return result;
+    };
     const service = chatChannelService(db, {
       idleOptimizations: process.env.PAPERCLIP_TEST_CHAT_IDLE_OPTIMIZATIONS === "true",
       deferWebhookProcessing: true,
       fetch: fakeSlackFetch() as typeof globalThis.fetch,
-      heartbeat: { wakeup: receiptBackedWakeup(wakeup) },
+      heartbeat: { wakeup: observeWakeup },
       publicBaseUrl: "https://paperclip.example",
       runtime: runtime as unknown as ChatSdkRuntime,
       scheduleDeferredWork: (task) => deferred.push(task),
@@ -16134,7 +16143,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const competingService = chatChannelService(db, {
       idleOptimizations: process.env.PAPERCLIP_TEST_CHAT_IDLE_OPTIMIZATIONS === "true",
       fetch: fakeSlackFetch() as typeof globalThis.fetch,
-      heartbeat: { wakeup: receiptBackedWakeup(wakeup) },
+      heartbeat: { wakeup: observeWakeup },
       publicBaseUrl: "https://paperclip.example",
       runtime: new FakeChatSdkRuntime() as unknown as ChatSdkRuntime,
     });
@@ -16143,22 +16152,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // Simulate another server process reconciling the same durable rows at
     // the same time as the webhook process's deferred drain.
     await competingService.processPendingDeliveries();
-    await vi.waitFor(async () => {
-      const rows = await db
-        .select()
-        .from(chatConversations)
-        .where(eq(chatConversations.endpointId, endpoint.id));
-      expect(rows).toHaveLength(1);
-    });
-    const [conversation] = await db
+    // The competing sweep can return before the deferred owner starts or after
+    // losing its lease. Keep that owner running until all eight durable wake
+    // receipts exist, then inspect the completed conversation and batch.
+    // The test's existing deadline still bounds a missing or stalled wake.
+    await batchReceipts;
+    const conversations = await db
       .select()
       .from(chatConversations)
       .where(eq(chatConversations.endpointId, endpoint.id));
-    // The competing sweep can return after losing the conversation lease while
-    // the deferred owner is still admitting messages. Join that owner's work
-    // through the service drain before asserting the whole batch. This keeps
-    // the test's normal deadline and does not require eight turns to fit in
-    // vi.waitFor's default one-second polling window.
+    expect(conversations).toHaveLength(1);
+    const [conversation] = conversations;
     await service.shutdown();
     await competingService.shutdown();
     const comments = await db
