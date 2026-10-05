@@ -152,7 +152,6 @@ import { createToolGatewayService } from "./services/tool-gateway.js";
 import { toolAccessService } from "./services/tool-access.js";
 import { chatChannelService } from "./services/chat-channels.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
-import { enqueueChatRunMilestones } from "./services/chat-run-publications.js";
 import {
   createCoalescedAsyncTrigger,
   isChatPublicationCommitSignal,
@@ -480,6 +479,7 @@ export async function createApp(
     bindHost: string;
     authPublicBaseUrl?: string;
     chatWebhookPublicBaseUrl?: string;
+    chatIdleOptimizations?: boolean;
     authReady: boolean;
     companyDeletionEnabled: boolean;
     announcements?: { enabled: boolean; feedUrl: string };
@@ -585,6 +585,7 @@ export async function createApp(
   });
   const chatChannels = chatChannelService(db, {
     deferWebhookProcessing: true,
+    idleOptimizations: opts.chatIdleOptimizations === true,
     heartbeat: connectionIntentHeartbeat,
     publicBaseUrl: opts.authPublicBaseUrl,
     webhookPublicBaseUrl: opts.chatWebhookPublicBaseUrl,
@@ -1172,7 +1173,7 @@ export async function createApp(
     processFailedGitHubWebhookDeliveries: () =>
       chatChannels.processFailedGitHubWebhookDeliveries(),
     projectRunMilestones: () =>
-      enqueueChatRunMilestones(db, {
+      chatChannels.enqueueRunMilestones({
         publicBaseUrl: opts.authPublicBaseUrl,
       }),
     flushPublications: () => flushChatPublications(),
