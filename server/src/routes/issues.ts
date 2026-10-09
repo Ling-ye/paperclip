@@ -6791,7 +6791,47 @@ export function issueRoutes(
       return false;
     }
 
-    if (!isExplicitResumeCapableStatus(issue.status)) {
+    if (
+      issue.status === "in_review" &&
+      options.resumeIntent === true &&
+      req.body.status === "todo" &&
+      req.actor.type === "agent"
+    ) {
+      const action = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+      if (
+        !action ||
+        action.ownerType !== "agent" ||
+        action.wakePolicy?.type !== "bounded_owner_disposition_repair" ||
+        action.ownerAgentId !== req.actor.agentId ||
+        action.returnOwnerAgentId !== req.actor.agentId ||
+        issue.assigneeAgentId !== req.actor.agentId
+      ) {
+        res.status(409).json({
+          error: "In-review follow-up requires the original owner's active disposition repair",
+          details: { issueId: issue.id },
+        });
+        return false;
+      }
+      const source = await svc.getById(issue.id);
+      const reviewPath = source && await classifySourceRecoveryRevalidation({
+        issue: source,
+        trigger: "issue_update",
+        statusChanged: true,
+      });
+      if (reviewPath) {
+        res.status(409).json({ error: reviewPath, details: { issueId: issue.id } });
+        return false;
+      }
+      const readiness = await svc.getDependencyReadiness(issue.id);
+      if (readiness.unresolvedBlockerCount > 0) {
+        res.status(409).json({
+          error: "Issue follow-up blocked by unresolved blockers",
+          details: { issueId: issue.id, unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds },
+        });
+        return false;
+      }
+      await assertSafeRecoveryHandBackGates({ req, issue, recoveryAction: action });
+    } else if (!isExplicitResumeCapableStatus(issue.status)) {
       res.status(409).json({
         error: "Issue is not resumable through comment follow-up intent",
         details: { issueId: issue.id, status: issue.status },
@@ -15296,12 +15336,20 @@ export function issueRoutes(
           // Re-derive closed-ness from the post-update issue so a status change
           // like in_progress -> done with a closure comment does not enqueue a
           // stale issue_commented wake for an already-completed issue.
-          // A completed prior run may explicitly resume, but the run that still
-          // owns this issue is already executing the comment's work.
+          // A completed prior run may explicitly resume. The current run only
+          // queues a successor when it owns a bounded disposition repair.
           const shouldWakeAssigneeForComment =
             shouldWakeAssigneeForIssueComment({
               selfComment,
               resumeRequested: resumeRequested === true,
+              allowCurrentIssueRunResume:
+                resumeRequested === true &&
+                actor.actorType === "agent" &&
+                actor.actorId === assigneeId &&
+                activeRecoveryActionBeforeUpdate?.ownerType === "agent" &&
+                activeRecoveryActionBeforeUpdate.ownerAgentId === actor.actorId &&
+                activeRecoveryActionBeforeUpdate.returnOwnerAgentId === actor.actorId &&
+                activeRecoveryActionBeforeUpdate.wakePolicy?.type === "bounded_owner_disposition_repair",
               commentCreatedByRunId: comment.createdByRunId,
               issueAtCommentStart: existing,
               reopened,

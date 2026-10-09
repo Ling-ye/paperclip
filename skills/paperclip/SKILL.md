@@ -253,11 +253,11 @@ Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`,
 - `done` — work complete, no follow-up on this issue.
 - `cancelled` — intentionally abandoned, not to be resumed.
 
-### Continuing unfinished work after a successful batch
+**Continuing unfinished work after a successful batch**
 
 When an assigned agent finishes a batch but still has authorized work, inspect the current task and its recovery action. An agent-owned `bounded_owner_disposition_repair` action is a bounded prompt to choose a valid disposition. It cannot use `POST /api/issues/{id}/recovery-actions/resolve` to retry the task. That retry path accepts a board-owned `board_escalation` action and a board actor.
 
-If you are the original assignee, the user already authorized continuation, and there is no Stop, pause, budget, approval, unresolved dependency, pending interaction, or active execution gate, use `PATCH /api/issues/{id}` with `status: "todo"`, `resume: true`, and an explanatory `comment`. Confirm the returned task status and that one successor run was queued. A repeat of the same continuation request must not create a second queued run. If the task is waiting, record its real blocker, pending interaction, or a still-valid monitor. A monitor cleared by `max_attempts_exhausted` cannot be reset for another wake. When there is no legal next path, let the bounded repair escalate to the board.
+If you are the original assignee, the user already authorized continuation, and there is no Stop, pause, budget, approval, unresolved dependency, pending interaction, or conflicting execution gate, use `PATCH /api/issues/{id}` with `status: "todo"`, `resume: true`, and an explanatory `comment`. Confirm the returned task status and one queued or deferred successor request. A deferred request runs after the current repair run ends. A repeat of the same continuation request must not create a second successor request. If the task is waiting, record its real blocker, pending interaction, or a still-valid monitor. A monitor cleared by `max_attempts_exhausted` cannot be reset for another wake. When there is no legal next path, let the bounded repair escalate to the board.
 
 ### Monitors and Watchers (say only what you actually scheduled)
 
