@@ -10,6 +10,10 @@ doc/PUBLISHING.md @cryppadotta @devinfoley @nickyleach @forgottendev
 doc/RELEASE-AUTOMATION-SETUP.md @cryppadotta @devinfoley @nickyleach @forgottendev
 skills/** @cryppadotta @devinfoley @nickyleach @forgottendev
 
+# Review configuration and repository rules
+/.greptile/ @cryppadotta @devinfoley @nickyleach @forgottendev
+/rules/ @cryppadotta @devinfoley @nickyleach @forgottendev
+
 # Package files — dependency changes require review
 # package.json matches recursively at all depths (covers root + all workspaces)
 package.json @cryppadotta @devinfoley @nickyleach @forgottendev

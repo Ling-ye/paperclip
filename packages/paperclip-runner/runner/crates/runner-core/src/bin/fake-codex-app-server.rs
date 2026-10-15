@@ -652,6 +652,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|value| value == "--require-codex-home-auth");
     let durable_turn_ids = args.iter().any(|value| value == "--durable-turn-ids");
+    let hold_first_durable_turn = args
+        .iter()
+        .any(|value| value == "--hold-first-durable-turn");
     let durable_tool_ids = args.iter().any(|value| value == "--durable-tool-ids");
     let expected_canonical_task_context_file =
         argument(&args, "--expected-canonical-task-context-file");
@@ -1031,6 +1034,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "initialized" => {}
             "thread/start" => {
+                if let Some(delay) = argument(&args, "--thread-start-delay-ms") {
+                    thread::sleep(Duration::from_millis(delay.parse()?));
+                }
                 if require_external_sandbox
                     && (message.pointer("/params/sandbox") != Some(&json!("danger-full-access"))
                         || message.pointer("/params/permissions").is_some())
@@ -1073,7 +1079,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 send(json!({
                     "id": id,
-                    "result": {"thread": {"id": state.thread_id, "sessionId": "codex-account-session"}}
+                    "result": {"thread": {"id": state.thread_id, "sessionId": "codex-account-session"},
+                        "model": argument(&args, "--returned-model").map(Value::String).unwrap_or_else(|| message.pointer("/params/model").filter(|model| model.is_string()).cloned().unwrap_or(json!("gpt-test")))}
                 }))?;
                 if agent_created_goal {
                     send(json!({
@@ -1348,6 +1355,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .checked_add(1)
                         .ok_or("fake provider turn sequence exhausted")?;
                 }
+                let hold_turn = hold_turn || (hold_first_durable_turn && state.next_turn == 1);
                 if reject_second_turn_start && turn_start_count == 2 {
                     send(json!({
                         "method": "warning",

@@ -1,4 +1,10 @@
 import {
+  PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
+  PRP_BLOCK_TOOL_DESCRIPTION,
+  PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA,
+  PRP_COMPLETION_TOOL_DESCRIPTION,
+} from "../../contracts/completion-result.js";
+import {
   CODEX_BLOCK_RESULT_OUTPUT_SCHEMA,
   CODEX_INVALID_REQUEST,
   CODEX_METHOD_NOT_FOUND,
@@ -540,6 +546,10 @@ describe("Codex app-server Codex driver", () => {
     expect(started.developerInstructions).toBe(conversationMode === "direct" ? undefined : baseInstructions);
     expect(resumed.developerInstructions).toBe(conversationMode === "direct" ? "" : baseInstructions);
     expect(resumed.dynamicTools).toEqual(started.dynamicTools);
+    expect(started.dynamicTools).toEqual(conversationMode === "direct" ? [] : [
+      { name: "paperclip_finish", description: PRP_COMPLETION_TOOL_DESCRIPTION, inputSchema: PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA },
+      { name: "paperclip_block", description: PRP_BLOCK_TOOL_DESCRIPTION, inputSchema: PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA },
+    ]);
     expect(resumed.config).toEqual(started.config);
     await recovered.session?.close({ reason: "verified additive recovery" });
   });

@@ -24,7 +24,7 @@ use crate::qualified_launch::verify_launch_artifact;
 use crate::question_response::validate_question_response;
 
 pub const CODEX_APP_SERVER_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
-const QUALIFIED_OPENCODE_VERSION: &str = "1.18.32";
+const QUALIFIED_OPENCODE_VERSION: &str = "1.18.34";
 const DEFAULT_PROVIDER_TRACE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BUFFERED_MESSAGES: usize = 1_024;
 const MAX_BUFFERED_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -32,6 +32,11 @@ const WARM_ATTACHMENT_TAIL_DRAIN_LIMIT: usize = 256;
 const WARM_ATTACHMENT_QUIET_WINDOW: Duration = Duration::from_millis(10);
 const WARM_ATTACHMENT_DRAIN_DEADLINE: Duration = Duration::from_millis(100);
 const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
+    "PAPERCLIP_AI_PROVIDER_KEY",
+    "PAPERCLIP_AI_PROVIDER_URL",
+    "PAPERCLIP_AGENT_KEY_ID",
+    "PAPERCLIP_AGENT_PUBLIC_KEY",
+    "PAPERCLIP_AGENT_PRIVATE_KEY",
     "OPENROUTER_API_KEY",
     "PAPERCLIP_NATIVE_MCP_NAME",
     "PAPERCLIP_NATIVE_MCP_URL",
@@ -242,6 +247,15 @@ impl ProviderTraceSink {
     }
 
     fn frame(&mut self, direction: &str, raw: &[u8]) -> Option<u64> {
+        // Raw protocol frames can contain arbitrary private-key fragments.
+        // Preserve trace metadata without retaining raw content for identity runs.
+        let redacted =
+            if std::env::var("PAPERCLIP_AGENT_PRIVATE_KEY").is_ok_and(|key| !key.is_empty()) {
+                "[REDACTED: agent identity runtime]".to_owned()
+            } else {
+                String::from_utf8_lossy(raw).into_owned()
+            };
+        let raw = redacted.as_bytes();
         if self.captured_bytes.saturating_add(raw.len()) > self.max_bytes {
             self.truncated = true;
             return None;
@@ -353,6 +367,8 @@ pub struct CodexProviderConfig {
     pub approval_policy: String,
     #[serde(default)]
     pub externally_sandboxed: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
     // Older persisted configurations deliberately retain the provider default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_skill_instructions: Option<bool>,
@@ -370,6 +386,13 @@ pub struct CodexSkillInput {
     pub input_type: String,
     pub name: String,
     pub path: String,
+}
+
+/// Optional inputs for one turn; omitted fields preserve provider defaults.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CodexTurnOptions<'a> {
+    pub skills: &'a [CodexSkillInput],
+    pub reasoning_mode: Option<&'a str>,
 }
 
 impl CodexSkillInput {
@@ -648,6 +671,7 @@ pub struct CodexProvider {
     next_request_id: u64,
     thread_id: String,
     provider_session_id: Option<String>,
+    observed_model: Option<String>,
     active_provider_turn_id: Option<String>,
     pending_messages: VecDeque<BufferedProviderMessage>,
     deferred_ambiguous_messages: VecDeque<BufferedProviderMessage>,
@@ -792,6 +816,10 @@ const GITHUB_CREDENTIAL_ENVIRONMENT_KEYS: &[&str] = &[
 ];
 
 const CODEX_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
+    "PAPERCLIP_AI_PROVIDER_KEY",
+    "PAPERCLIP_AGENT_KEY_ID",
+    "PAPERCLIP_AGENT_PUBLIC_KEY",
+    "PAPERCLIP_AGENT_PRIVATE_KEY",
     "CODEX_HOME",
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
@@ -804,6 +832,10 @@ fn codex_permission_profile(provider: &str, external_sandbox: bool) -> &'static 
     } else {
         "paperclip-runner-workspace-only"
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl CodexProvider {
@@ -879,11 +911,15 @@ impl CodexProvider {
             ));
         }
         let authorized_tools = authorized_tools.into_iter().collect::<Vec<_>>();
-        let permission_profile = codex_permission_profile(
-            &config.provider,
-            config.externally_sandboxed
-                || std::env::var("PAPERCLIP_RUNNER_EXTERNAL_SANDBOX").as_deref() == Ok("1"),
-        );
+        let permission_profile = if config.read_only {
+            "paperclip-runner-workspace-read-only"
+        } else {
+            codex_permission_profile(
+                &config.provider,
+                config.externally_sandboxed
+                    || std::env::var("PAPERCLIP_RUNNER_EXTERNAL_SANDBOX").as_deref() == Ok("1"),
+            )
+        };
         let (dynamic_tools, authorized_tool_ids) =
             codex_dynamic_tools(authorized_tools.iter().cloned())?;
         let common_environment_keys = [
@@ -978,6 +1014,7 @@ impl CodexProvider {
             next_request_id: 1,
             thread_id: String::new(),
             provider_session_id: None,
+            observed_model: None,
             active_provider_turn_id: None,
             pending_messages: VecDeque::new(),
             deferred_ambiguous_messages: VecDeque::new(),
@@ -1108,6 +1145,12 @@ impl CodexProvider {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned);
+            provider.observed_model = opened
+                .get("model")
+                .or_else(|| opened.pointer("/thread/model"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 240)
+                .map(str::to_owned);
 
             if resume_thread_id.is_some() {
                 stage = ProviderStartupStage::ThreadRead;
@@ -1148,6 +1191,10 @@ impl CodexProvider {
 
     pub fn provider_session_id(&self) -> Option<&str> {
         self.provider_session_id.as_deref()
+    }
+
+    pub fn observed_model(&self) -> Option<&str> {
+        self.observed_model.as_deref()
     }
 
     pub(crate) fn take_provider_trace_frame_id(&mut self) -> Option<u64> {
@@ -1652,15 +1699,36 @@ impl CodexProvider {
     }
 
     pub fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
-        self.start_turn_with_skills(message, cwd, &[])
+        self.start_turn_with_options(message, cwd, CodexTurnOptions::default())
     }
 
-    pub fn start_turn_with_skills(
+    pub fn start_turn_with_options(
         &mut self,
         message: &str,
         cwd: &str,
-        skills: &[CodexSkillInput],
+        options: CodexTurnOptions<'_>,
     ) -> Result<Value, LocalRunnerError> {
+        self.start_turn_with_options_and_effort(message, cwd, options, None)
+    }
+
+    pub(crate) fn start_turn_with_options_and_effort(
+        &mut self,
+        message: &str,
+        cwd: &str,
+        options: CodexTurnOptions<'_>,
+        effort: Option<&Value>,
+    ) -> Result<Value, LocalRunnerError> {
+        let CodexTurnOptions {
+            skills,
+            reasoning_mode,
+        } = options;
+        if reasoning_mode.is_some_and(|mode| {
+            self.config.provider != "opencode" || !matches!(mode, "default" | "disabled")
+        }) {
+            return Err(LocalRunnerError::invalid(
+                "turn.reasoningMode requires OpenCode and must be default or disabled",
+            ));
+        }
         if skills.len() > 64 || (self.config.provider != "codex" && !skills.is_empty()) {
             return Err(LocalRunnerError::invalid(
                 "explicit skills require Codex and at most 64 selections",
@@ -1668,6 +1736,17 @@ impl CodexProvider {
         }
         for skill in skills {
             skill.validate()?;
+        }
+        let effort = effort.filter(|value| !value.is_null());
+        if effort.is_some_and(|value| {
+            !matches!(
+                value.as_str(),
+                Some("minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra")
+            )
+        }) {
+            return Err(LocalRunnerError::invalid(
+                "unsupported native Codex reasoning effort",
+            ));
         }
         if self.quarantined {
             return Err(LocalRunnerError::invalid(
@@ -1709,6 +1788,12 @@ impl CodexProvider {
         let turn_params_object = turn_params
             .as_object_mut()
             .expect("Codex turn parameters are an object");
+        if let Some(effort) = effort {
+            turn_params_object.insert("effort".to_owned(), effort.clone());
+        }
+        if let Some(mode) = reasoning_mode {
+            turn_params_object.insert("reasoningMode".to_owned(), json!(mode));
+        }
         if self.permission_profile == "paperclip-runner-external-sandbox" {
             turn_params_object.insert(
                 "sandboxPolicy".to_owned(),
@@ -4055,6 +4140,7 @@ done
             instructions: "Test only.".to_owned(),
             approval_policy: "never".to_owned(),
             externally_sandboxed: false,
+            read_only: false,
             include_skill_instructions: None,
             conversation_mode: None,
         };
@@ -4442,6 +4528,7 @@ done
             instructions: String::new(),
             approval_policy: "never".to_owned(),
             externally_sandboxed: false,
+            read_only: false,
             include_skill_instructions: None,
             conversation_mode: None,
         };
@@ -4562,6 +4649,7 @@ done
             instructions: String::new(),
             approval_policy: "never".to_owned(),
             externally_sandboxed: false,
+            read_only: false,
             include_skill_instructions: None,
             conversation_mode: None,
         };

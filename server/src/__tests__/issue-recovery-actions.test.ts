@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import {
+  costEvents,
   agents,
   agentRuntimeState,
   authUsers,
@@ -36,6 +38,8 @@ import { deliverReconciledExecutions } from "../services/execution-recovery-reso
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { issueService } from "../services/issues.js";
+import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -154,6 +158,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(issueComments);
     await db.delete(environmentLeases);
     await db.delete(activityLog);
+    await db.delete(costEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
@@ -361,12 +366,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   it.each(["company", "issue", "legacy", "finished"])("rejects an apparently live run with the wrong %s authority", async (mismatch) => {
     const { companyId, sourceIssueId, runId, svc } = await seedNativeFinalizationRecovery("running");
     const other = await seedCompany();
-    await db.update(heartbeatRuns).set({
+    // Exercise service rejection of historical corruption behind the immutable binding trigger.
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`set local session_replication_role = replica`);
+      await tx.update(heartbeatRuns).set({
       ...(mismatch === "company" ? { companyId: other.companyId, agentId: other.coderId } : {}),
       ...(mismatch === "issue" ? { nativeIssueId: other.sourceIssueId } : {}),
       ...(mismatch === "legacy" ? { runtimeMode: "legacy" } : {}),
       ...(mismatch === "finished" ? { finishedAt: new Date() } : {}),
     }).where(eq(heartbeatRuns.id, runId));
+    });
     expect((await svc.getActiveForIssue(companyId, sourceIssueId))?.nativeRunActivity).toBeNull();
   });
 
@@ -653,17 +662,19 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     // The operator retries the same remote branch under two spellings. Both map
     // to the canonical `origin/fix/foo` identity, so recovery must not reset the
-    // attempt count or post a second notice.
+    // attempt count. Each failed run still needs its own actionable notice.
+    const firstRun = makeRun("fix/foo", "origin/fix/foo");
+    const secondRun = makeRun("origin/fix/foo", "origin/fix/foo");
     await recovery.escalateStrandedAssignedIssue({
       issue: sourceIssue,
       previousStatus: "in_progress",
-      latestRun: makeRun("fix/foo", "origin/fix/foo"),
+      latestRun: firstRun,
       recoveryCause: "configuration_incomplete",
     });
     await recovery.escalateStrandedAssignedIssue({
       issue: sourceIssue,
       previousStatus: "in_progress",
-      latestRun: makeRun("origin/fix/foo", "origin/fix/foo"),
+      latestRun: secondRun,
       recoveryCause: "configuration_incomplete",
     });
 
@@ -682,7 +693,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       `source_scoped_recovery:${sourceIssue.companyId}:${sourceIssue.id}:configuration_incomplete:workspace_base_ref:origin/fix/foo`,
     );
 
-    // The operator gets one notice, bound to the one action.
+    // Each run gets one notice bound to the same action; reconciling the
+    // latest run again must not duplicate its notice.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue, previousStatus: "in_progress", latestRun: secondRun,
+      recoveryCause: "configuration_incomplete",
+    });
     const notices = await db
       .select({ metadata: issueComments.metadata })
       .from(issueComments)
@@ -696,7 +712,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       notices.filter((row) =>
         noticeMetadataReferencesRecoveryAction(row.metadata, actions[0]!.id),
       ),
-    ).toHaveLength(1);
+    ).toHaveLength(2);
+    expect(notices.map((row) => row.metadata?.sourceRunId).sort()).toEqual([firstRun.id, secondRun.id].sort());
   });
 
   it("gives a distinct recovery identity and a new operator notice when the unresolved base ref changes", async () => {
@@ -1779,6 +1796,29 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it.each(["resolved", "cancelled"])("omits %s recovery instructions when the original worker resumes", async (status) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId, sourceIssueId, kind: "stranded_assigned_issue", ownerType: "board",
+      returnOwnerAgentId: coderId, cause: "stranded_assigned_issue", fingerprint: "finished-recovery",
+      evidence: { failureSummary: "Retry budget exhausted during cleanup." },
+      nextAction: "Repair the runtime, then retry the original owner.", wakePolicy: null,
+    });
+    await db.update(issueRecoveryActions).set({ status, outcome: "handed_back", resolvedAt: new Date() })
+      .where(eq(issueRecoveryActions.id, action.id));
+    const payload = await buildPaperclipWakePayload({ db, companyId, contextSnapshot: {
+      issueId: sourceIssueId, wakeReason: "issue_recovery_action_restored",
+      recoveryActionId: action.id, recoveryCause: action.cause,
+    } });
+    expect(payload?.issue?.id).toBe(sourceIssueId);
+    expect(payload?.recovery).toBeNull();
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain("Implement backend recovery");
+    expect(prompt).not.toContain("Recovery contract:");
+    expect(prompt).not.toContain(action.nextAction);
+    expect(prompt).not.toContain("Do not produce the deliverable");
+  });
+
   it("accepts new verified evidence after an automatic no-replay disposition without reopening on duplicate requests", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     const runId = randomUUID();
@@ -2619,6 +2659,51 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       trigger: "read_projection",
       recoveryActionId: action.id,
     });
+    expect(activityRows.find((row) => row.action === "issue.recovery_action_resolved")).toMatchObject({
+      actorType: "system", actorId: "recovery", agentId: null,
+    });
+  });
+
+  it.each(["done", "cancelled"])("keeps one workspace owner hold across reads and sweeps of a %s task", async (status) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    const owner = { token: randomUUID(), hostname: "old-controller.invalid", pid: 42, processStartedAt: new Date(0).toISOString() };
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId: coderId, nativeIssueId: sourceIssueId,
+      runtimeMode: "native", status: "failed", finishedAt: new Date(),
+      runnerProfileJson: { nativeWorkspaceFinalizationOwner: owner },
+    });
+    await db.update(issues).set({ status }).where(eq(issues.id, sourceIssueId));
+    const userId = "board-reader";
+    const app = createApp({ type: "board", source: "local_implicit", userId });
+    const copyback = vi.fn();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    let firstAction: typeof issueRecoveryActions.$inferSelect | undefined;
+    for (let tick = 0; tick < 3; tick += 1) {
+      expect(await withNativeWorkspaceFinalizationOwnership({ db, companyId, runId }, copyback)).toEqual({ acquired: false });
+      const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+      expect(detail.body.activeRecoveryAction).toMatchObject({
+        cause: "native_workspace_finalization_owner_unverified", status: "active", attemptCount: 1,
+      });
+      await request(app).get(`/api/companies/${companyId}/issues?view=compact`).expect(200);
+      await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).expect(200);
+      await recovery.reconcileStrandedAssignedIssues();
+      const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(actions).toHaveLength(1);
+      firstAction ??= actions[0]!;
+      expect(actions[0]).toEqual(firstAction);
+    }
+    expect(copyback).not.toHaveBeenCalled();
+    expect(await issueService(db).list(companyId, { touchedByUserId: userId })).toEqual([]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId))).toHaveLength(0);
+
+    // Only clearing the exact physical owner receipt makes this hold stale.
+    await db.update(heartbeatRuns).set({ runnerProfileJson: {} }).where(eq(heartbeatRuns.id, runId));
+    const cleared = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(cleared.body.activeRecoveryAction).toBeNull();
+    const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId));
+    expect(rows).toEqual([expect.objectContaining({ actorType: "system", actorId: "recovery", action: "issue.recovery_action_resolved" })]);
+    expect(await issueService(db).list(companyId, { touchedByUserId: userId })).toEqual([]);
   });
 
   it("keeps active recovery visible when a plain comment does not create a live path", async () => {

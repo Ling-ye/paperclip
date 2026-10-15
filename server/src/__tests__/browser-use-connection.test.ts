@@ -34,6 +34,8 @@ import {
 import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { browserUseViewports } from "../services/browser-use-viewport.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { registerBrowserUseCleanup } from "../services/browser-use-work.js";
 import { browserUseService } from "../services/browser-use.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "../services/connector-runtime.js";
 import { registerAssignedMcpGateway } from "../services/native-runtime/assigned-mcp-tools.js";
@@ -313,6 +315,47 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
         },
       };
     }
+    it("wakes the app worker from request-service commits and restores durable poll and lease deadlines", async () => {
+      const f = await fixture();
+      const background = browserUseService(db, f.request);
+      const sweep = vi.spyOn(background, "sweep");
+      const onError = vi.fn();
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError });
+      try {
+        await registerBrowserUseCleanup(coordinator, background, () => true).ready;
+        expect(coordinator.nextWakeAt()).toBeNull();
+        expect(await background.nextSweepAt()).toBeNull();
+        const started = await f.service.execute(f.binding, f.grant, randomUUID(), "browser_start", { task: "Read example.com" }) as { sessionId: string };
+        await vi.waitFor(() => expect(sweep.mock.calls.length).toBeGreaterThan(1));
+        await coordinator.stop();
+        expect(onError).not.toHaveBeenCalled();
+
+        const poll = new Date(Date.now() + 60_000);
+        const lease = new Date(Date.now() + 180_000);
+        await db.update(browserUseSessions).set({ nextPollAt: poll, leaseUntil: lease })
+          .where(eq(browserUseSessions.id, started.sessionId));
+        expect(await background.nextSweepAt()).toBe(lease.getTime());
+        const restarted = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError });
+        try {
+          await registerBrowserUseCleanup(restarted, browserUseService(db, f.request), () => true).ready;
+          expect(restarted.nextWakeAt()).toBe(lease.getTime());
+        } finally { await restarted.stop(); }
+        await db.update(browserUseSessions).set({ leaseUntil: new Date(0) })
+          .where(eq(browserUseSessions.id, started.sessionId));
+        expect(await background.nextSweepAt()).toBe(poll.getTime());
+        await db.update(browserUseSessions).set({ leaseUntil: null })
+          .where(eq(browserUseSessions.id, started.sessionId));
+        expect(await background.nextSweepAt()).toBe(poll.getTime());
+        const [session] = await db.select().from(browserUseSessions).where(eq(browserUseSessions.id, started.sessionId));
+        await f.service.control(session, "end");
+        expect(await background.nextSweepAt()).toBeLessThan(poll.getTime());
+        await db.update(browserUseSessions).set({ status: "closed" }).where(eq(browserUseSessions.id, started.sessionId));
+        expect(await background.nextSweepAt()).toBeNull();
+      } finally {
+        await coordinator.stop();
+        await db.update(browserUseSessions).set({ status: "closed" }).where(eq(browserUseSessions.companyId, f.company.id));
+      }
+    });
     it("keeps Cloud instructions out of universal skills and unassigned runtime overlays", async () => {
       const skills = await listPaperclipSkillEntries(fileURLToPath(new URL("../", import.meta.url)), [fileURLToPath(new URL("../../../skills", import.meta.url))]);
       expect(skills.some(skill => skill.runtimeName === "paperclip")).toBe(true);
@@ -983,8 +1026,15 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
         )[0],
       ).toMatchObject({ eventCursor: 9, eventsDrained: 1, accountedCents: 15 });
     });
-    it("protects interactive viewer routes from agent, other-company and read-only access", async () => {
+    it.each(["task", "saved chat"])("protects %s browser routes from agent, other-company and read-only access", async (kind) => {
       const f = await fixture();
+      if (kind === "saved chat") {
+        await db.update(issues).set({
+          conversationAgentId: f.agent.id,
+          conversationUserId: actor.actorId,
+          conversationState: "active",
+        }).where(eq(issues.id, f.issue.id));
+      }
       await f.service.execute(
         f.binding,
         f.grant,
@@ -1021,11 +1071,19 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
       });
       app.use(browserUseRoutes(db, f.service));
       app.use(errorHandler);
+      const listPath = `/issues/${f.issue.id}/browsers`;
+      const listed = await http(app).get(listPath);
+      expect(listed.status).toBe(200);
+      expect(listed.body).toMatchObject([{ id: browser.id, issueId: f.issue.id }]);
+      const missing = await http(app).get(`/issues/${randomUUID()}/browsers`);
+      expect(missing.status).toBe(404);
+      expect(missing.body).toEqual({ error: "Task not found" });
       const path = `/issues/${f.issue.id}/browsers/${browser.id}/viewer`;
       const ok = await http(app).get(path);
       expect(ok.status).toBe(200);
       expect(ok.headers["cache-control"]).toBe("no-store");
       expect(ok.headers["referrer-policy"]).toBe("no-referrer");
+      const controlPath = path.replace("/viewer", "/control");
       const presencePath = path.replace("/viewer", "/presence");
       expect((await http(app).post(presencePath)).status).toBe(200);
       const resizePath = path.replace("/viewer", "/viewport");
@@ -1065,7 +1123,10 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
         (await http(app).post(resizePath).send({ preset: "custom", width: 1 }))
           .status,
       ).toBe(400);
+      expect((await http(app).post(controlPath).send({ action: "cancel" })).status).toBe(200);
       mode = "agent";
+      expect((await http(app).get(listPath)).status).toBe(403);
+      expect((await http(app).post(controlPath).send({ action: "keep_open" })).status).toBe(403);
       expect((await http(app).post(presencePath)).status).toBe(403);
       expect(
         (await http(app).post(`${resizePath}/release`).send({ viewerId }))
@@ -1076,6 +1137,10 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
       ).toBe(403);
       expect((await http(app).get(path)).status).toBe(403);
       mode = "other-company";
+      const inaccessible = await http(app).get(listPath);
+      expect(inaccessible.status).toBe(missing.status);
+      expect(inaccessible.body).toEqual(missing.body);
+      expect((await http(app).post(controlPath).send({ action: "keep_open" })).status).toBe(404);
       expect((await http(app).post(presencePath)).status).toBe(404);
       expect(
         (await http(app).post(`${resizePath}/release`).send({ viewerId }))
@@ -1091,6 +1156,8 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
         .set({ membershipRole: "viewer" })
         .where(eq(companyMemberships.companyId, f.company.id));
       expect((await http(app).get(path)).status).toBe(403);
+      expect((await http(app).get(listPath)).body).toEqual([]);
+      expect((await http(app).post(controlPath).send({ action: "keep_open" })).status).toBe(403);
       expect((await http(app).post(presencePath)).status).toBe(403);
       expect(
         (await http(app).post(resizePath).send({ preset: "phone" })).status,

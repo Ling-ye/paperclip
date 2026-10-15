@@ -127,6 +127,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/runtime-tools\/github\/credentials$/ },
   // Identity, inbox, agent self-management
   { method: "GET", path: /^\/api\/agents\/me$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/agent-commentary$/ },
   { method: "GET", path: /^\/api\/agents\/me\/inbox-lite$/ },
   { method: "GET", path: /^\/api\/agents\/me\/inbox\/mine$/ },
   { method: "GET", path: /^\/api\/agents\/[^/]+$/ },
@@ -161,6 +162,8 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // Issue lifecycle: read context, checkout, update, comment, document, release
   { method: "GET", path: /^\/api\/issues\/[^/]+$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/heartbeat-context$/ },
+  // The controller still checks company membership and issue read authority.
+  { method: "GET", path: /^\/api\/issues\/[^/]+\/activity$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/comments(?:\/[^/]+)?$/ },
   { method: "POST", path: /^\/api\/issues\/[^/]+\/comments$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/documents(?:\/[^/]+)?$/ },

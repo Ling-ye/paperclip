@@ -297,6 +297,54 @@ function autocompleteOption(matchText: string) {
 }
 
 describe("TaskChatComposer", () => {
+  it("keeps creation images inline and prevents submission during their upload", async () => {
+    let resolveUpload!: (url: string) => void;
+    const onImageUpload = vi.fn().mockReturnValue(new Promise<string>((resolve) => { resolveUpload = resolve; }));
+    const creation = {
+      value: "Before the screenshot",
+      onChange: vi.fn(),
+      onSubmit: vi.fn().mockResolvedValue(undefined),
+      submitLabel: "Create task",
+      onSelectFiles: vi.fn(),
+      runSettings: null,
+      onRunSettingsChange: vi.fn(),
+    };
+    render(<TaskChatComposer creation={creation} workMode="standard" onImageUpload={onImageUpload} />);
+    const image = new File(["png"], "screen.png", { type: "image/png" });
+    expect(pasteFiles([image]).defaultPrevented).toBe(false);
+    expect(creation.onSelectFiles).not.toHaveBeenCalled();
+    const handler = mdxEditorMockState.imagePluginOptions!.imageUploadHandler!;
+    const upload = handler(image);
+    await flushAsync();
+    expect(sendButton().disabled).toBe(true);
+    pressKey("Enter", { metaKey: true });
+    expect(creation.onSubmit).not.toHaveBeenCalled();
+    resolveUpload("/api/assets/screen/content");
+    const url = await upload;
+    const value = `Before the screenshot\n\n![screen](${url})\n\nAfter the screenshot`;
+    render(<TaskChatComposer creation={{ ...creation, value }} workMode="standard" onImageUpload={onImageUpload} />);
+    await flushAsync();
+    flushSync(() => sendButton().click());
+    await flushAsync();
+    expect(creation.onSubmit).toHaveBeenCalledWith(value, "standard", null);
+    expect(onImageUpload).toHaveBeenCalledWith(image);
+  });
+
+  it("stages non-image creation paste files while images reach the editor", () => {
+    const creation = {
+      value: "Inspect these files",
+      onChange: vi.fn(), onSubmit: vi.fn().mockResolvedValue(undefined),
+      submitLabel: "Create task", onSelectFiles: vi.fn(),
+      runSettings: null, onRunSettingsChange: vi.fn(),
+    };
+    render(<TaskChatComposer creation={creation} workMode="standard" onImageUpload={vi.fn()} />);
+    const image = new File(["png"], "screen.png", { type: "image/png" });
+    const document = new File(["notes"], "notes.txt", { type: "text/plain" });
+    expect(pasteFiles([image, document]).defaultPrevented).toBe(false);
+    expect(creation.onSelectFiles).toHaveBeenCalledWith([document]);
+    expect(pasteFiles([document]).defaultPrevented).toBe(true);
+  });
+
   it("settles an acknowledged submission after navigating away", async () => {
     const key = "navigate-before-save";
     let resolveSend!: () => void;
@@ -1651,6 +1699,25 @@ describe("TaskChatComposer", () => {
         .querySelector('[data-assignee-identity="agent:a2"]')
         ?.getAttribute("data-assignee-option-icon"),
     ).toBe("agent:a2");
+  });
+
+  it("uses assignment suggestions and retains a manual human choice after refresh", async () => {
+    const view = (suggestion: string) => <TaskChatComposer onAdd={vi.fn()} workMode="standard"
+      enableReassign currentAssigneeValue="user:u1" suggestedAssigneeValue={suggestion}
+      reassignOptions={[{ id: "agent:a1", label: "Alpha" }, { id: "agent:a2", label: "Beta" }, { id: "user:u1", label: "Me" }]}
+      agentMap={new Map([["a1", { icon: "bot" }], ["a2", { icon: "bot" }]])} />;
+    render(view("agent:a1"));
+    const trigger = () => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-assignee"]')!;
+    expect(trigger().textContent).toContain("Alpha");
+    flushSync(() => root!.render(view("agent:a2")));
+    expect(trigger().textContent).toContain("Beta");
+    flushSync(() => trigger().click());
+    await flushAsync();
+    const me = document.querySelector('[data-assignee-identity="user:u1"]')!.closest("button")!;
+    flushSync(() => me.click());
+    await flushAsync();
+    flushSync(() => root!.render(view("agent:a1")));
+    expect(trigger().textContent).toContain("Me");
   });
 
   it("shows human avatars in assignee options and after selection", async () => {

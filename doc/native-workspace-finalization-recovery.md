@@ -9,6 +9,15 @@ A completed workspace barrier is reread
 under ownership before export, and a committed coordinator cannot be overwritten
 by a late failure receipt.
 
+An unverified workspace owner keeps one board recovery action for its exact run
+and owner fingerprint. Repeated recovery checks do not consume attempts or
+rewrite that action. Task completion or cancellation does not prove the old
+physical writer stopped, so reads and recovery sweeps retain this action while
+the matching run still carries that owner receipt. After the receipt is cleared
+or replaced, ordinary stale-action cleanup applies. Cleanup is attributed to
+the system; historical cleanup from page reads does not add tasks to a person's
+inbox or refresh issue activity timestamps.
+
 The lock transaction holds no row locks. Ordinary progress and finalization
 receipts remain visible through the normal database pool. A dedicated connection outside the application pool is
 reserved for the duration of copyback and closed when it settles; even a one-connection application pool remains available for progress writes. Its run profile carries
@@ -26,7 +35,65 @@ leave tar/Git children alive, so incomplete copyback requires operator stop
 verification even on the same host. PID reuse is checked against its recorded
 start time rather than trusted by PID alone.
 
+## Automatic cloud recovery
+
+New Railway copyback receipts record the exact project, environment, service and
+deployment ID. On takeover, the existing finalization reconciler asks the cloud
+harness to inspect that deployment. The harness resolves the stack's owned
+resources independently and issues a short-lived Ed25519 receipt only when the
+exact deployment is `REMOVED` with `deploymentStopped: true`. This covers all
+processes in the deployment, including orphaned copyback children. Missing,
+truncated, live or unavailable provider evidence leaves the physical fence intact.
+
+The tenant verifies the configured harness key, disjoint receipt audience, stack,
+run, owner token, deployment identity and expiry. It records proof and an activity
+entry when replacing only the exact owner under the existing advisory lock. The
+normal reconciler resumes the accepted result; it does not create a provider turn
+or change approval/monitor waits. A changed owner during verification fails closed.
+
+Stop proof alone does not authorize old work to overwrite a current task. After
+the provider read, automatic recovery uses the operator path's shared binding
+checks under short coordinator, issue and run row locks, atomically with the
+owner claim. The task must still be open, assigned to the run or its authoritative
+review participant, and bound to that running native execution and accepted
+result. A different checkout, newer execution or queued/running legacy execution
+prevents takeover. Publication checks repeat this validation; row locks are never
+held across physical copyback I/O.
+
+The harness endpoint is `POST /v1/tenant/workspace-worker-stop`. The fleet-wide
+server token authorizes a read request, never stop evidence: responses must be
+signed by the harness. This endpoint requires the companion cloud harness change.
+Deploying only the application keeps unknown owners fenced. No cloud provider
+credentials are delivered to tenant applications.
+
+The task view shows only “Restoring saved work…” after the server confirms recovery
+or an operator queues it,
+then removes the notice when commitment resolves recovery. It exposes no process
+identifiers, shutdown form or manual resume control. Legacy receipts without
+platform identity and unsupported platforms say operator assistance is needed;
+operators use the documented exact-owner API below after independent stop proof.
+The three diagnosed historical receipts do not gain a deployment identity merely
+by upgrading. Never infer one from elapsed time or a hostname.
+
 ## Unverified copyback after controller replacement
+
+Generic orphan recovery does not turn a missing provider PID into `process_lost`
+while the native coordinator is `workspace_finalizing` with an accepted result
+bound to the same company, issue, and run. The finalizer owns that unfinished
+suffix, including the interval before it acquires its physical owner receipt.
+The heartbeat's phase or profile alone does not establish this authority.
+The conditional orphan write rechecks the durable result and the heartbeat's
+PostgreSQL tuple version, so a result published while the write waits on its row
+lock cannot be overwritten using an older statement snapshot. Result publishers
+lock and update that heartbeat in the same transaction as acceptance.
+
+The running run keeps its source lease while the existing finalizer either
+completes, records its bounded failure policy, or requires operator stop
+verification. A new queued run or a healthy child task cannot clear an
+unverified copyback hold. Verified finalization clears the matching run's hold
+after commitment. Existing terminal-task dispositions and explicit cancellation
+remain unchanged; this does not recover a source already destroyed by an older
+controller or claim that an unfinished export succeeded.
 
 The controller cannot verify a process on a foreign or unknown host, or orphaned
 copyback children after an abrupt parent death before the success barrier. It surfaces
@@ -38,6 +105,48 @@ An instance operator must first verify through the deployment platform that the
 exact prior controller **and its copyback subprocesses** have stopped. Retain the
 sandbox, accepted native result, and workspace descriptor. Do not run a new
 provider turn, delete workspace contents, or relax archive confinement.
+
+For legacy receipts, an authorized company owner, company administrator or
+instance administrator records independently verified platform evidence through
+the operator API. The task has no shutdown form or resume control. The API is
+`POST /api/issues/:id/recovery-actions/resume-workspace-finalization` with:
+
+```json
+{
+  "actionId": "<recovery-action-id>",
+  "runId": "<run-id>",
+  "ownerToken": "<owner-token-from-recovery-evidence>",
+  "controllerAndCopybackStopped": true,
+  "stopEvidence": "<deployment-platform evidence for this controller and its children>"
+}
+```
+
+This is an operator attestation, not an automatic deployment-platform probe.
+The separate `runtime:confirm_owner_stop` authorization action limits this
+attestation to active company owners or administrators, the trusted local board,
+or an instance administrator. Ordinary runtime managers and agents cannot release
+the physical owner receipt. Missing role data keeps the client notice read-only.
+A
+missing advisory connection alone is insufficient. Admission rejects an active
+copyback lock, an observably live local controller, a changed owner, a newer run,
+or an unbound result. It records the exact owner and operator evidence atomically
+with releasing the receipt. The accepted result, workspace descriptor, source
+lease, task status, monitors, and approval waits are unchanged. The ordinary
+reconciler performs copyback and applies the saved result through the status
+arbiter. No provider wake is enqueued. The recovery action remains visible until
+finalization commits. Admission supports saved-result copyback from `result_accepted`,
+`workspace_finalizing`, and `retryable_failure`; an abandoned retry does not need
+a replacement run. The existing retry schedule remains unchanged.
+Repeating the same confirmation before reconciliation is
+idempotent; it cannot release a newer owner. Generic recovery resolution, including
+false-positive dispositions, cannot dismiss this hold or bypass saved-result
+finalization.
+
+Repeated sweeps preserve these copyback-specific instructions, including for
+older actions whose recovery budget was already exhausted. They must never
+recommend starting a replacement provider run for this hold.
+
+For older servers without this action, the maintenance fallback follows.
 
 After that platform verification, use a database maintenance transaction to
 release only the exact receipt shown by the recovery action. Replace the four
@@ -111,8 +220,8 @@ A board member with runtime management access can complete the saved result:
    the export failure while preserving all user files. Restore transport access
    or other provider prerequisites before retrying. Extending the sandbox
    retention window can be necessary during this repair.
-3. In the task's **Workspace export needs repair** notice, describe the repair and
-   choose **Retry workspace export**. The equivalent board API is
+3. Use the operator API to record the repair and request export-only retry. The
+   task shows operator assistance is needed, without an infrastructure form. The board API is
    `POST /api/issues/:id/recovery-actions/retry-workspace-export` with
    `{ "actionId": "<recovery-action-id>", "runId": "<run-id>", "repairNote": "<repair and preservation evidence>" }`.
 4. Confirm the same run commits, the saved result determines the task outcome,
@@ -201,3 +310,28 @@ plugin RPC. Its intent pins the registered built-in provider and its receipt say
 `builtin.stopLease`. This provider owns no real process or filesystem; the receipt
 models its lifecycle. Missing built-in stop support or an unconfirmed receipt
 also remains pending through restart, without calling release or destroy.
+
+### Legacy copy-back after a confirmed stop
+
+A legacy adapter can report failed workspace copy-back after cancellation has
+already stopped and released its sandbox lease. The host records the exact lease
+snapshot from before adapter dispatch. For an originally ephemeral source, the
+recorder can preserve the released allocation for repair only while the current
+lease is still ephemeral and its company, run, issue, workspace, provider,
+allocation, acquisition time, plugin, and realized root still match. It requires
+both the dedicated stop-and-retain receipt and the matching stopped-execution
+receipt. A competing owner or changed source fails closed. The recorder leaves
+release status and receipts intact, excludes the allocation from reuse, and
+creates the existing board-owned file-repair obligation without replaying work
+or changing a newer run or the task's status.
+
+This late-recording path does not admit reusable leases. Provider resume can
+precede the database handoff, so an old stop receipt and a database row lock
+cannot prove that reuse has not started. Existing active-source and previously
+recorded recovery paths retain their behavior. A missing or rejected original
+snapshot does not authorize adopting another released lease.
+
+A retained source receipt records control-plane evidence; it does not prove the
+provider still holds the original bytes or that copy-back succeeded. Operators
+must verify and recover the exact source separately. Later successful runs and
+completed tasks do not certify recovery of earlier workspace files.

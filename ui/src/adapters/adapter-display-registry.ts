@@ -127,6 +127,14 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     description: "Cursor CLI harness",
     icon: MousePointer2,
   },
+  // Display-only choice: persisted as paperclip_runner with provider openai_dot.
+  grok_bot: { label: "Grok Bot", experimental: true, icon: Bot, description: "An existing external Bot in Grok" },
+  openai_dot: {
+    label: "OpenAI Dot",
+    description: "Your Dot in ChatGPT",
+    icon: Bot,
+    experimental: true,
+  },
   cursor_cloud: {
     label: "Cursor Cloud",
     description: "Managed remote Cursor agent",

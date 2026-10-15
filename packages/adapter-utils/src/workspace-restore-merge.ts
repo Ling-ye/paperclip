@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createWorkspaceManifest, WorkspaceManifestMap, workspacePathMatcher, type PathManifest, type WorkspacePaths, type WorkspaceManifestWriter } from "./workspace-manifest.js";
 import { shouldExcludePath } from "./exclude-patterns.js";
 import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
+import type { WorkspaceRestoreDiagnostic } from "./workspace-restore-diagnostics.js";
 
 export type SnapshotEntry =
   | { kind: "dir" }
@@ -146,21 +147,37 @@ async function hashFile(filePath: string): Promise<string> {
 async function* walkDirectory(
   root: string, exclude: readonly string[], ignored: ReturnType<typeof workspacePathMatcher>, relative = "",
 ): AsyncGenerator<[string, SnapshotEntry]> {
+  const readEntry = async (nextRelative: string): Promise<[string, SnapshotEntry | null]> => {
+    const fullPath = path.join(root, nextRelative);
+    const stats = await fs.lstat(fullPath);
+    if (stats.isDirectory()) return [nextRelative, { kind: "dir" }];
+    if (stats.isSymbolicLink()) return [nextRelative, { kind: "symlink", target: await fs.readlink(fullPath) }];
+    if (stats.isFile()) return [nextRelative, { kind: "file", mode: stats.mode, hash: await hashFile(fullPath) }];
+    return [nextRelative, null];
+  };
+  const visitBatch = async function* (paths: string[]): AsyncGenerator<[string, SnapshotEntry]> {
+    const results = await Promise.allSettled(paths.map(readEntry));
+    for (const result of results) if (result.status === "rejected") throw result.reason;
+    for (const result of results) {
+      if (result.status !== "fulfilled") continue;
+      const [nextRelative, entry] = result.value;
+      if (!entry) continue;
+      yield [nextRelative, entry];
+      if (entry.kind === "dir") yield* walkDirectory(root, exclude, ignored, nextRelative);
+    }
+  };
   const current = relative ? path.join(root, relative) : root;
+  let batch: string[] = [];
   for await (const entry of await fs.opendir(current)) {
     const nextRelative = relative ? path.posix.join(relative, entry.name) : entry.name;
     if (shouldExcludePath(nextRelative, exclude) || ignored.matches(nextRelative)) continue;
-    const fullPath = path.join(root, nextRelative);
-    const stats = await fs.lstat(fullPath);
-    if (stats.isDirectory()) {
-      yield [nextRelative, { kind: "dir" }];
-      yield* walkDirectory(root, exclude, ignored, nextRelative);
-    } else if (stats.isSymbolicLink()) {
-      yield [nextRelative, { kind: "symlink", target: await fs.readlink(fullPath) }];
-    } else if (stats.isFile()) {
-      yield [nextRelative, { kind: "file", mode: stats.mode, hash: await hashFile(fullPath) }];
+    batch.push(nextRelative);
+    if (batch.length === 16) {
+      yield* visitBatch(batch);
+      batch = [];
     }
   }
+  if (batch.length) yield* visitBatch(batch);
 }
 
 async function readSnapshotEntry(root: string, relative: string): Promise<SnapshotEntry | null> {
@@ -292,7 +309,7 @@ export type WorkspaceRestoreFailureCode =
  */
 export type WorkspaceRestoreOutcome =
   | { readonly ok: true }
-  | { readonly ok: false; readonly code: WorkspaceRestoreFailureCode };
+  | { readonly ok: false; readonly code: WorkspaceRestoreFailureCode; readonly diagnostic?: WorkspaceRestoreDiagnostic };
 
 /**
  * Classifies a caught workspace-restore error into one allowlisted code. Maps
@@ -503,6 +520,40 @@ export async function withDirectoryMergeLock<T>(
   // Canonicalize before we hash or lock: a retargeted symlink must not let the
   // lock protect one directory while the caller mutates another.
   const canonicalTargetDir = await fs.realpath(targetDir);
+  return withCanonicalDirectoryMergeLock(canonicalTargetDir, fn, env, diagnosticOperation, waitMs);
+}
+
+export async function withDirectoryPublicationLock<T>(
+  targetDir: string,
+  fn: (canonicalTargetDir: string) => Promise<T>,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<T> {
+  const absoluteTarget = path.resolve(targetDir);
+  const parent = await fs.realpath(path.dirname(absoluteTarget));
+  const canonicalTargetDir = path.join(parent, path.basename(absoluteTarget));
+  const assertSafeLeaf = async () => {
+    const leaf = await fs.lstat(canonicalTargetDir).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (leaf && (!leaf.isDirectory() || leaf.isSymbolicLink())) {
+      throw new Error(`Directory publication target at ${canonicalTargetDir} is not a plain directory.`);
+    }
+  };
+  await assertSafeLeaf();
+  return withCanonicalDirectoryMergeLock(canonicalTargetDir, async () => {
+    await assertSafeLeaf();
+    return fn(canonicalTargetDir);
+  }, env);
+}
+
+async function withCanonicalDirectoryMergeLock<T>(
+  canonicalTargetDir: string,
+  fn: (canonicalTargetDir: string) => Promise<T>,
+  env: NodeJS.ProcessEnv,
+  diagnosticOperation?: DirectoryMergeLockOperation,
+  waitMs: number = LOCK_WAIT_MS,
+): Promise<T> {
   const lockRoot = await resolveDirectoryMergeLockRoot(env);
   const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
   const releaseLock = await acquireDirectoryMergeLock(path.join(lockRoot, `${lockKey}.lock`), diagnosticOperation, waitMs);
@@ -661,7 +712,7 @@ export async function mergeDirectoryWithBaseline(input: {
   afterApply?: () => Promise<void>;
   /** Caller holds the target's writer lock and validated an immutable sparse
    * source. Unchanged entries need no payload and are never copied. */
-  snapshots?: { source: DirectorySnapshot; current: DirectorySnapshot };
+  snapshots?: { source: DirectorySnapshot; current?: DirectorySnapshot };
 }): Promise<void> {
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
   const source = input.snapshots?.source ?? await captureDirectorySnapshot(input.sourceDir, options);

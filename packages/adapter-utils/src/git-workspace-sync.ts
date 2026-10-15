@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createWorkspaceManifest, workspacePaths, WorkspaceNulParser, type WorkspacePaths } from "./workspace-manifest.js";
 import { runWorkspaceGitProcess } from "./workspace-git-stream.js";
+import { preserveWorkspaceRestoreErrorDiagnostic, withWorkspaceRestoreGitCommand, type WorkspaceRestoreGitCommand } from "./workspace-restore-diagnostics.js";
 
 export interface GitCommandResult {
   stdout: string;
@@ -14,6 +15,7 @@ export interface GitCommandResult {
 export interface GitWorkspaceSnapshot {
   headCommit: string;
   branchName: string | null;
+  originUrl?: string | null;
   overlayPaths: WorkspacePaths;
   deletedPaths: WorkspacePaths;
   ignoredPaths: WorkspacePaths;
@@ -167,6 +169,33 @@ export function workspaceSnapshotTimeoutMs(): number {
   return Number.isFinite(configured) && configured >= 1000 ? Math.min(configured, 86_400_000) : 30 * 60_000;
 }
 
+export async function readManagedWorkspaceRepositories(localDir: string, options: { signal?: AbortSignal } = {}): Promise<NonNullable<GitWorkspaceSnapshot["repositories"]>> {
+  const repositories: NonNullable<GitWorkspaceSnapshot["repositories"]> = [];
+  try {
+
+      const root = path.join(localDir, PROJECT_REPOSITORIES_DIR);
+      const rootStat = await fs.lstat(root).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      });
+      if (rootStat) {
+        if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("Invalid project repositories directory");
+        for await (const entry of await fs.opendir(root)) {
+          if (!entry.isDirectory() || !/^[a-zA-Z0-9_-]+$/.test(entry.name)) throw new Error("Invalid project repository directory");
+          const relative = `${PROJECT_REPOSITORIES_DIR}/${entry.name}`;
+          const snapshot = await readGitWorkspaceSnapshot(path.join(localDir, relative), false, options);
+          if (!snapshot) throw new Error(`Project repository is not a Git checkout: ${relative}`);
+          repositories.push({ path: relative, snapshot });
+        }
+      }
+
+    return repositories;
+  } catch (error) {
+    for (const repo of repositories) await disposeGitWorkspaceSnapshot(repo.snapshot);
+    throw error;
+  }
+}
+
 export async function readGitWorkspaceSnapshot(localDir: string, includeRepositories = true, options: { signal?: AbortSignal } = {}): Promise<GitWorkspaceSnapshot | null> {
   const repositories: NonNullable<GitWorkspaceSnapshot["repositories"]> = [];
   // Only repository discovery may report an ordinary directory. A failed
@@ -204,23 +233,7 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
   options.signal?.addEventListener("abort", abort, { once: true });
   if (options.signal?.aborted) abort();
   try {
-    if (includeRepositories) {
-      const root = path.join(localDir, PROJECT_REPOSITORIES_DIR);
-      const rootStat = await fs.lstat(root).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return null;
-        throw error;
-      });
-      if (rootStat) {
-        if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("Invalid project repositories directory");
-        for await (const entry of await fs.opendir(root)) {
-          if (!entry.isDirectory() || !/^[a-zA-Z0-9_-]+$/.test(entry.name)) throw new Error("Invalid project repository directory");
-          const relative = `${PROJECT_REPOSITORIES_DIR}/${entry.name}`;
-          const snapshot = await readGitWorkspaceSnapshot(path.join(localDir, relative), false, options);
-          if (!snapshot) throw new Error(`Project repository is not a Git checkout: ${relative}`);
-          repositories.push({ path: relative, snapshot });
-        }
-      }
-    }
+    if (includeRepositories) repositories.push(...await readManagedWorkspaceRepositories(localDir, options));
 
     const scan = async (args: string[], operation: string, category: string) => {
       const parser = new WorkspaceNulParser((record) => {
@@ -266,6 +279,7 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
     const branch = (settled[1] as PromiseFulfilledResult<GitCommandResult>).value.stdout.trim();
     const snapshot: GitWorkspaceSnapshot = {
       headCommit: head, branchName: branch && branch !== "HEAD" ? branch : null,
+      originUrl: await readSanitizedOriginRemoteUrl(localDir),
       overlayPaths: writer.paths("overlay"), deletedPaths: writer.paths("deleted"), ignoredPaths: writer.paths("ignored"),
       ...(repositories.length ? { repositories } : {}),
     };
@@ -572,7 +586,7 @@ export async function readSanitizedOriginRemoteUrl(localDir: string): Promise<st
   }
 }
 
-async function copyCloneTree(source: string, target: string): Promise<void> {
+export async function copyCloneTree(source: string, target: string): Promise<void> {
   await fs.mkdir(target, { recursive: true });
   for await (const entry of await fs.opendir(source)) {
     const from = path.join(source, entry.name);
@@ -593,7 +607,7 @@ export async function withShallowGitWorkspaceClone<T>(
   const cloneDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-workspace-"));
   const tempRef = `refs/paperclip/git-sync/import/${randomUUID()}`;
   try {
-    const originUrl = await readSanitizedOriginRemoteUrl(input.localDir);
+    const originUrl = input.snapshot.originUrl !== undefined ? input.snapshot.originUrl : await readSanitizedOriginRemoteUrl(input.localDir);
     await runLocalGit(input.localDir, ["update-ref", tempRef, input.snapshot.headCommit], {
       timeout: 10_000,
       maxBuffer: 16 * 1024,
@@ -773,6 +787,12 @@ export function buildRemoteGitDeltaBundleScript(input: {
         `  bundle_base=""`,
         "fi",
       ]),
+    // An empty bundle means "still at baseSha" to the importer. A reset to an
+    // older ancestor has no delta commits either, but must carry its new tip.
+    // Use the full-bundle path so Git advertises that tip instead of losing it.
+    `if [ -n "$bundle_base" ] && [ "$bundle_base" != ${baseSha} ] && [ "$bundle_base" = "$(git -C ${remoteDir} rev-parse HEAD)" ]; then`,
+    `  bundle_base=""`,
+    "fi",
     `if [ -n "$bundle_base" ]; then`,
     `  commit_count=$(git -C ${remoteDir} rev-list --count HEAD --not "$bundle_base")`,
     "else",
@@ -803,6 +823,14 @@ export function buildRemoteGitDeltaBundleScript(input: {
   ].filter(Boolean).join("\n");
 }
 
+// Labels are fixed at the integration call sites, never derived from Git arguments.
+function runIntegrationGit(
+  command: WorkspaceRestoreGitCommand,
+  ...args: Parameters<typeof runLocalGit>
+): Promise<GitCommandResult> {
+  return withWorkspaceRestoreGitCommand(command, () => runLocalGit(...args));
+}
+
 /**
  * Preserve imported work whose history does not connect to the local one.
  *
@@ -824,11 +852,11 @@ export async function createUnrelatedHistoryGraftCommit(input: {
   importedHead: string;
   syncLabel: string;
 }): Promise<string> {
-  const importedTree = (await runLocalGit(input.localDir, ["rev-parse", `${input.importedHead}^{tree}`], {
+  const importedTree = (await runIntegrationGit("rev_parse", input.localDir, ["rev-parse", `${input.importedHead}^{tree}`], {
     timeout: 10_000,
     maxBuffer: 16 * 1024,
   })).stdout.trim();
-  const importedMessage = (await runLocalGit(input.localDir, ["log", "-1", "--format=%B", input.importedHead], {
+  const importedMessage = (await runIntegrationGit("log", input.localDir, ["log", "-1", "--format=%B", input.importedHead], {
     timeout: 10_000,
     maxBuffer: 256 * 1024,
   })).stdout;
@@ -837,8 +865,8 @@ export async function createUnrelatedHistoryGraftCommit(input: {
     "",
     `(${input.syncLabel} graft ${input.importedHead.slice(0, 12)}: imported history shares no ancestor with ${input.currentHead.slice(0, 12)})`,
   ].join("\n");
-  const graftCommit = await runLocalGit(
-    input.localDir,
+  const graftCommit = await runIntegrationGit(
+    "commit_tree", input.localDir,
     [...GIT_SYNC_COMMIT_IDENTITY_ARGS, "commit-tree", importedTree, "-p", input.currentHead, "-m", message],
     {
       timeout: 60_000,
@@ -848,9 +876,68 @@ export async function createUnrelatedHistoryGraftCommit(input: {
   return graftCommit.stdout.trim();
 }
 
+async function updateLocalGitHead(input: {
+  localDir: string;
+  newHead: string;
+  oldHead: string;
+  branchName: string | null;
+}): Promise<void> {
+  // Prepare the ref transaction before checking the symbolic HEAD identity.
+  // Git holds HEAD.lock (and the branch lock when attached) until commit/abort,
+  // so a checkout cannot redirect the write after this check. --no-deref also
+  // prevents a detached write from following a newly attached branch.
+  await withWorkspaceRestoreGitCommand("update_ref", () => new Promise<void>((resolve, reject) => {
+    let identityError: unknown;
+    let prepared = false;
+    let output = "";
+    const child = execFile("git", ["-C", input.localDir, "update-ref", "--stdin"], {
+      timeout: 15_000,
+      maxBuffer: 64 * 1024,
+    }, (error, stdout, stderr) => {
+      if (identityError) reject(identityError);
+      else if (error) reject(Object.assign(error, { stdout, stderr }));
+      else if (!stdout.includes("commit: ok\n")) reject(new Error("Git HEAD transaction did not commit."));
+      else resolve();
+    });
+    // Early Git errors close stdin; the process callback reports the error.
+    child.stdin!.on("error", () => {});
+    child.stdout!.on("data", (chunk: string | Buffer) => {
+      output += chunk.toString();
+      if (prepared || !output.includes("prepare: ok\n")) return;
+      prepared = true;
+      void (async () => {
+        try {
+          const branchName = (await runIntegrationGit("symbolic_ref", input.localDir, ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+            timeout: 10_000,
+          }).catch((error) => {
+            if (error.code === 1) return { stdout: "" };
+            throw error;
+          })).stdout.trim() || null;
+          if (branchName !== input.branchName) {
+            throw new Error("Workspace branch changed while remote work was running.");
+          }
+          child.stdin!.end("commit\n");
+        } catch (error) {
+          identityError = error;
+          child.stdin!.end("abort\n");
+        }
+      })();
+    });
+    child.stdin!.write([
+      "start",
+      ...(input.branchName === null ? ["option no-deref"] : []),
+      `update HEAD ${input.newHead} ${input.oldHead}`,
+      "prepare",
+      "",
+    ].join("\n"));
+  }));
+}
+
 export async function integrateImportedGitHead(input: {
   localDir: string;
   importedHead: string;
+  /** The host Git identity captured before staging this run. */
+  baseline?: Pick<GitWorkspaceSnapshot, "headCommit" | "branchName">;
 }): Promise<void> {
   const isConcurrentRefUpdateError = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -859,23 +946,25 @@ export async function integrateImportedGitHead(input: {
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const snapshot = {
-      headCommit: (await runLocalGit(input.localDir, ["rev-parse", "HEAD"])).stdout.trim(),
-      branchName: (await runLocalGit(input.localDir, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch((error) => {
+      headCommit: (await runIntegrationGit("rev_parse", input.localDir, ["rev-parse", "HEAD"])).stdout.trim(),
+      branchName: (await runIntegrationGit("symbolic_ref", input.localDir, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch((error) => {
         if (error.code === 1) return { stdout: "" };
         throw error;
       })).stdout.trim() || null,
     };
 
+    if (input.baseline && snapshot.branchName !== input.baseline.branchName) {
+      throw new Error("Workspace branch changed while remote work was running.");
+    }
     const currentHead = snapshot.headCommit;
     if (!currentHead || currentHead === input.importedHead) return;
 
-    const headRef = snapshot.branchName ? `refs/heads/${snapshot.branchName}` : "HEAD";
     // `git merge-base` exits 1 when the commits share no ancestor — the only
     // outcome that authorizes the graft fallback below. Every other failure
     // (timeout, missing object, repository error) must keep failing the
     // integration instead of silently rewriting the tip.
     let noCommonAncestor = false;
-    const mergeBase = await runLocalGit(input.localDir, ["merge-base", currentHead, input.importedHead], {
+    const mergeBase = await runIntegrationGit("merge_base", input.localDir, ["merge-base", currentHead, input.importedHead], {
       timeout: 10_000,
       maxBuffer: 16 * 1024,
     }).catch((error: unknown) => {
@@ -884,15 +973,15 @@ export async function integrateImportedGitHead(input: {
     });
     const mergeBaseHead = mergeBase?.stdout.trim() ?? "";
 
-    if (mergeBaseHead === input.importedHead) {
-      return;
-    }
-
-    if (mergeBaseHead === currentHead) {
+    // A rebase/amend rewrites the sandbox tip without a concurrent host edit.
+    // Adopt that history when the host still matches the run's starting tip;
+    // merging the old and rewritten commits can reintroduce resolved conflicts.
+    // Keep the expected-old-value check: if the host advances during this write,
+    // retry against its new tip and use the normal concurrent-history path.
+    if (mergeBaseHead === currentHead || (mergeBaseHead && currentHead === input.baseline?.headCommit)) {
       try {
-        await runLocalGit(input.localDir, ["update-ref", headRef, input.importedHead, currentHead], {
-          timeout: 10_000,
-          maxBuffer: 16 * 1024,
+        await updateLocalGitHead({
+          localDir: input.localDir, newHead: input.importedHead, oldHead: currentHead, branchName: snapshot.branchName,
         });
         return;
       } catch (error) {
@@ -901,7 +990,14 @@ export async function integrateImportedGitHead(input: {
       }
     }
 
+    if (mergeBaseHead === input.importedHead) {
+      return;
+    }
+
     if (noCommonAncestor) {
+      if (input.baseline && currentHead !== input.baseline.headCommit) {
+        throw new Error("Cannot restore unrelated remote history after the host advanced.");
+      }
       // No common ancestor — merging is impossible and failing here would
       // discard the imported work. Graft it onto the current head instead;
       // see createUnrelatedHistoryGraftCommit.
@@ -912,9 +1008,8 @@ export async function integrateImportedGitHead(input: {
         syncLabel: "Paperclip remote git sync",
       });
       try {
-        await runLocalGit(input.localDir, ["update-ref", headRef, graftCommit, currentHead], {
-          timeout: 10_000,
-          maxBuffer: 16 * 1024,
+        await updateLocalGitHead({
+          localDir: input.localDir, newHead: graftCommit, oldHead: currentHead, branchName: snapshot.branchName,
         });
         return;
       } catch (error) {
@@ -925,23 +1020,23 @@ export async function integrateImportedGitHead(input: {
 
     let mergedTree;
     try {
-      mergedTree = await runLocalGit(input.localDir, ["merge-tree", "--write-tree", currentHead, input.importedHead], {
+      mergedTree = await runIntegrationGit("merge_tree", input.localDir, ["merge-tree", "--write-tree", currentHead, input.importedHead], {
         timeout: 60_000,
         maxBuffer: 256 * 1024,
       });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      throw new Error(
+      throw preserveWorkspaceRestoreErrorDiagnostic(new Error(
         `Failed to merge concurrent remote git histories for ${currentHead.slice(0, 12)} and ${input.importedHead.slice(0, 12)}: ${reason}`,
-      );
+      ), error);
     }
     const mergedTreeId = mergedTree.stdout.trim().split("\n")[0]?.trim() ?? "";
     if (!mergedTreeId) {
       throw new Error("Failed to compute a merged git tree for workspace restore.");
     }
 
-    const mergeCommit = await runLocalGit(
-      input.localDir,
+    const mergeCommit = await runIntegrationGit(
+      "commit_tree", input.localDir,
       [
         ...GIT_SYNC_COMMIT_IDENTITY_ARGS,
         "commit-tree",
@@ -959,9 +1054,8 @@ export async function integrateImportedGitHead(input: {
       },
     );
     try {
-      await runLocalGit(input.localDir, ["update-ref", headRef, mergeCommit.stdout.trim(), currentHead], {
-        timeout: 10_000,
-        maxBuffer: 16 * 1024,
+      await updateLocalGitHead({
+        localDir: input.localDir, newHead: mergeCommit.stdout.trim(), oldHead: currentHead, branchName: snapshot.branchName,
       });
       return;
     } catch (error) {
@@ -990,7 +1084,9 @@ export async function resetLocalGitIndexToHead(input: {
         (error as { stdout?: unknown }).stdout,
       ].filter((value): value is string => typeof value === "string" && value.trim().length > 0).join("\n")
       : String(error);
-    throw new Error(`Failed to reset local git index to HEAD after workspace restore: ${detail}`);
+    throw preserveWorkspaceRestoreErrorDiagnostic(
+      new Error(`Failed to reset local git index to HEAD after workspace restore: ${detail}`), error,
+    );
   }
 
   const hasDiff = async (args: string[]) => {

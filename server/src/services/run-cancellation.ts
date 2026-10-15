@@ -1,7 +1,7 @@
 import type { heartbeatRuns } from "@paperclipai/db";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect, "status" | "startedAt" | "finishedAt" | "runtimeMode" | "errorCode" | "error" | "resultJson">;
-const SOURCES = ["operator", "queued_message", "shutdown", "provider", "transport", "control_plane", "unknown"] as const;
+const SOURCES = ["operator", "queued_message", "shutdown", "provider", "transport", "control_plane", "controller_lease", "unknown"] as const;
 export type CancellationSource = typeof SOURCES[number];
 export interface RunCancellation {
   source: CancellationSource;
@@ -37,6 +37,22 @@ export function requestedRunCancellation(result: Run["resultJson"], reason: stri
     type: user ? "user" : agent ? "agent" : "system",
     ...(typeof actorId === "string" ? { id: actorId } : {}),
   }, reason: reason.slice(0, 512), recordedAt: new Date().toISOString() };
+}
+
+const LEGACY_CONTROLLER_LEASE_LOSS_CAUSES = ["renewal_rejected", "renewal_deadline", "renewal_error"] as const;
+export type LegacyControllerLeaseLossCause = typeof LEGACY_CONTROLLER_LEASE_LOSS_CAUSES[number];
+const controllerLeaseLossReason = (cause: LegacyControllerLeaseLossCause) => `Legacy controller lease lost (${cause})`;
+
+/** The host aborted its own adapter after losing durable run ownership. */
+export function controllerLeaseLossCancellation(cause: LegacyControllerLeaseLossCause): RunCancellation {
+  return { source: "controller_lease", expected: false, initiator: { type: "system" },
+    reason: controllerLeaseLossReason(cause), recordedAt: new Date().toISOString() };
+}
+
+/** Closed cause label for diagnostics; only the server-written reason matches. */
+export function readControllerLeaseLossCause(cancellation: RunCancellation): LegacyControllerLeaseLossCause | null {
+  if (cancellation.source !== "controller_lease") return null;
+  return LEGACY_CONTROLLER_LEASE_LOSS_CAUSES.find(cause => cancellation.reason === controllerLeaseLossReason(cause)) ?? null;
 }
 
 /** Preserve recorded stop intent when adapter completion replaces resultJson. */

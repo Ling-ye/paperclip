@@ -32,6 +32,19 @@ import {
 } from "./selectors.js";
 
 describe("runner E2E catalog", () => {
+  it("keeps private repository skill delivery explicit and bounded in both environments", () => {
+    const cases = runnerMatrix.filter(entry => entry.suite.id === "repository-skills");
+    expect(cases).toHaveLength(2);
+    expect(cases.map(entry => entry.environment.id)).toEqual(["local", "daytona"]);
+    for (const entry of cases) {
+      expect(entry.suite.manualOnly).toBe(true);
+      expect(entry.task.automaticRetryPolicy).toBe("single_attempt");
+      expect(entry.task.expectedRunCount).toBe(1);
+      expect(entry.requiredCredentials).toContain("GITHUB_TOKEN");
+      expect(entry.requiredCredentials).toContain("OPENAI_API_KEY");
+      expect(entry.requiredCredentials.includes("DAYTONA_API_KEY")).toBe(entry.environment.id === "daytona");
+    }
+  });
   it.each(["daytona-journal-continuity"])(
     "%s retains native processes with fixed external instructions",
     (suiteId) => {
@@ -104,6 +117,16 @@ describe("runner E2E catalog", () => {
     }
   });
 
+  it("keeps paid public MCP journeys explicit and fingerprints the shipped workflow instructions", () => {
+    const suite = runnerSuites.find(suite => suite.id === "public-mcp")!;
+    expect(suite.manualOnly).toBe(true);
+    expect(suite.environments.map(environment => environment.id)).toEqual(["local"]);
+    expect(suite.profiles.map(profile => profile.model)).toEqual(["gpt-5.4-mini", "claude-haiku-4-5-20251001", "claude-sonnet-4-6"]);
+    expect(suite.tasks).toHaveLength(21);
+    expect(suite.tasks.every(task => task.flow === "public_mcp" && task.expectedRunCount === 1)).toBe(true);
+    expect(suite.definitionMetadata?.workflowDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(selectRunnerExecutions(parseRunnerSelectors(["--all"])).some(execution => execution.suite.id === "public-mcp")).toBe(false);
+  });
   it("defines sixteen local connection-review journeys without expanding the default matrix", () => {
     expect(connectionReviewSuite.expectedMatrixSize).toBe(16);
     expect(new Set(connectionReviewSuite.profiles.map(profile => profile.id))).toEqual(new Set(["runner-codex", "runner-acpx-claude", "legacy-codex", "legacy-claude"]));
@@ -136,10 +159,10 @@ describe("runner E2E catalog", () => {
     expect(localIntegrityTasks).toHaveLength(2);
     expect(openRouterBreadthTasks).toHaveLength(3);
     expect(runnerSuites.map((suite) => suite.expectedMatrixSize)).toEqual([
-      6, 30, 3, 16, 16, 2, 6, 8, 46, 23, 50, 20, 52, 28, 18, 2, 6, 6, 12, 10, 48, 16, 10, 2, 1, 1,
+      3, 4, 8, 10, 4, 4, 6, 63, 12, 6, 2, 30, 3, 16, 16, 2, 6, 8, 46, 2, 23, 15, 52, 6, 6, 20, 26, 52, 28, 18, 2, 6, 6, 12, 10, 48, 16, 10, 2, 1, 1, 116, 2,
     ]);
-    expect(validateRunnerCatalog()).toHaveLength(438);
-    expect(new Set(runnerMatrix.map((entry) => entry.id)).size).toBe(438);
+    expect(validateRunnerCatalog()).toHaveLength(729);
+    expect(new Set(runnerMatrix.map((entry) => entry.id)).size).toBe(729);
     expect(
       runnerMatrix.filter((entry) => entry.suite.id === "core-compatibility"),
     ).toHaveLength(48);
@@ -428,13 +451,13 @@ describe("runner E2E catalog", () => {
 
   it("uses only declared secret references in generated payloads", () => {
     expect(
-      runnerMatrix.every((entry) =>
+      runnerMatrix.filter(entry => entry.task.flow !== "provider_connection").every((entry) =>
         entry.requiredCredentials.includes(entry.profile.credential),
       ),
     ).toBe(true);
     expect(
       runnerMatrix
-        .filter((entry) => entry.environment.id === "daytona")
+        .filter((entry) => entry.environment.id === "daytona" && entry.task.flow !== "provider_connection")
         .every((entry) =>
           entry.requiredCredentials.includes("DAYTONA_API_KEY"),
         ),
@@ -450,7 +473,7 @@ describe("runner E2E catalog", () => {
     expect(contextIntegrityProfiles.map((profile) => profile.id)).toEqual(
       expect.arrayContaining(pendingContextIntegrityProfiles.map((profile) => profile.id)),
     );
-    expect(UNQUALIFIED_PROFILE_GAPS.pi).toMatch(/no qualified model source/);
+    expect(UNQUALIFIED_PROFILE_GAPS).not.toHaveProperty("pi");
   });
 
   it("blocks pending profiles before provider admission", () => {

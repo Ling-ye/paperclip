@@ -7,18 +7,47 @@ event needs no operator endpoint.
 
 ## Native PRP Run-Log Events
 
+Fresh remote Codex model substitution emits `runner.model_fallback` on the
+system stream with `warn` severity. Its payload contains `requestedModel`,
+`effectiveModel`, and `codexCliVersion`. It records a preparation choice before
+provider launch, not a failed turn or a retry. The same substitution appears as
+a system warning in the task conversation. It remains local run-log data.
+
 The hidden native coordinator writes each validated PRP event to the bound
 run's existing event stream before it acknowledges the runner. The row keeps
 the PRP `eventType`, source instance, source event ID, source sequence, protocol
-schema version, and a SHA-256 digest of the canonical source envelope. Its
+schema version, and a SHA-256 digest of the canonical stored envelope. Its
 payload is `{ "prpEvent": <canonical PRP event> }`.
+
+Native API tool events omit HTTP request and response bodies from durable history.
+This includes serialized provider `contentItems`, legacy HTTP receipts and
+`call_api` arguments. Saved receipts retain the operation and call IDs, success
+flag, HTTP status and content type when present. The body becomes
+`***REDACTED***`, with `apiPayloadRedacted: true` and `apiPayloadSha256`, a SHA-256
+digest of the original payload. These digests distinguish duplicate events from
+changed payloads; they cannot recover omitted bodies for debugging or replay.
+The model receives the original authorized response. Credential-bearing mutation
+receipts use encrypted storage separately from this run log.
+
+Checkpoints and completion records apply the same redaction. Completion retries
+compare stored and expected payloads through the control-plane port's idempotent
+`normalizeReplayPayload` projection, so a saved redacted result can be confirmed
+without restoring API bodies. Ports without a projection compare their original
+payloads. Repeated redaction preserves the original digest and detects changed
+private payloads.
+
+The native runtime passes this projection through backend recovery to the Codex
+driver. Recovery compares saved semantic results and turn fingerprints with
+provider history through the same representation. A private body change retains
+its distinct digest and fails recovery; an unchanged body does not require
+restoring its plaintext into the checkpoint.
 
 PostgreSQL JSONB cannot represent NUL (U+0000), which can occur in command
 output such as Vite virtual-module paths. The run-event payload column uses a
 lossless storage codec for these events: the JSONB projection renders NUL as
 the literal `\u0000`, and the reserved `$paperclipRunEventJsonV1` field contains
 the original serialized JSON as a doubly escaped string. Ordinary payloads
-retain their existing representation. Drizzle reads restore the exact original
+retain their existing representation. Drizzle reads restore the exact stored
 payload before replay, hash validation, redaction, or API presentation. SQL
 queries can still inspect ordinary routing fields in the projection; raw SQL
 readers of the whole payload must apply `decodeRunEventPayload`. The column
@@ -51,6 +80,13 @@ final provider state, pending call/operation/source-event IDs and input digests,
 and incomplete result-delivery command IDs and statuses. If execution and
 cleanup both fail, execution retains its original error identity and cleanup is
 attached as `cleanupError`.
+
+Semantic settlement also includes up to 20 content-free failure records, with
+the call ID, operation ID, stage (`dispatch` or `persist_result`), and cause.
+Causes distinguish an oversized command, a full command journal, known storage
+errors, dispatcher rejection, and other persistence failures. Exception messages
+and tool results are excluded. These diagnostics do not authorize replay of an
+operation whose outcome is unknown.
 
 Instruction writes also commit an `agent.instruction_write_attempted` activity
 row and a run-scoped `instructionToolAttempts` entry before permitting the
@@ -102,6 +138,14 @@ The event never includes bootstrap tickets, reconnect leases, authentication
 proofs, encryption keys, environment variables, provider credentials, command
 arguments, or an unsanitized stderr stream. Detailed failed-attempt diagnostics
 remain in the bounded `native_run_finalizations.recovery_history` ledger.
+
+For a local Codex turn lost while runnerd was stopped, the canonical `turn.failed`
+event retains `error.code: "provider_turn_lost_on_restore"` and
+`error.recoverable: true`. It records the interrupted turn, not a final task
+outcome. There is no synthesized result for that interruption. An admitted
+same-session continuation emits its own `turn.submitted`, accepted turn ID, and
+terminal events; only the final outcome closes the run. Reconstructed thread
+history retains the original error so reconciliation and live delivery agree.
 
 ## Native Local Process Stop Evidence
 
@@ -196,6 +240,41 @@ The payload never carries a command, an argument, a path, an environment value,
 or a raw identifier. The event rides the `ctx.onEvent` run-event bridge and is
 run-log-only. It needs no OTLP endpoint.
 
+## Workspace Restore and Settled Run Measurements
+
+The heartbeat controller writes these records with `eventType: "lifecycle"`,
+`stream: "system"`, and `level: "info"`. The event name below is its `message`
+and its payload's `phase`. They remain in the instance run log and add no
+Paperclip Telemetry or OpenTelemetry export.
+
+| Event | Payload fields besides `phase` | Meaning |
+| --- | --- | --- |
+| `workspace_checkpoint` | `mode`, `scannedEntries`, `changedFiles`, `payloadBytes` | Metrics for a validated sparse checkpoint, or a full restore fallback. |
+| `workspace.restore` | `durationMs` | Wall time around native workspace restoration. |
+| `task.run.measured` | `durationMs`, `outcome`, `durableSettlement` | Wall time through terminal owner cleanup, with the persisted terminal run status and `durableSettlement: true`. |
+
+For `workspace_checkpoint`, `mode` is `"sparse"` or `"full"`. Sparse metrics
+count snapshot entries in `scannedEntries`, regular files in the validated
+downloaded payload in `changedFiles`, and their total bytes in `payloadBytes`.
+Deleted entries and symlinks do not add to the regular-file count or byte total.
+Full fallback reports all three counts as `null`: unavailable, not zero. A run
+can emit multiple checkpoint records while restoring its repositories. These
+payloads contain no paths, filenames, file contents, or credentials.
+
+`workspace.restore` is emitted when the timed restoration exits, including an
+exception. It has no outcome field and does not by itself prove restore success.
+Its producer is the native workspace sync `onPhase` callback.
+
+`task.run.measured` is emitted only after the controller observes a terminal run
+with no remaining native runner ownership. Its duration starts at `startedAt`,
+or `createdAt` if the run never started, and includes preparation, execution,
+finalization, and cleanup. It is not model-only time; the creation-time fallback
+also includes time spent queued. `outcome` is the actual terminal status, such as
+`succeeded`, `failed`, or `cancelled`. Provider turn completion can precede this
+settlement record. The record does not imply exactly-once emission across
+controller recovery, and failure to write it is logged without changing the
+already-settled outcome.
+
 ## ACP terminal failure diagnostics
 
 The shared ACP adapter engine preserves typed terminal session failures in the
@@ -241,11 +320,15 @@ section in the Observability contract.
 
 Cancelled runs retain `resultJson.cancellation`: a closed `source` label
 (`operator`, `queued_message`, `shutdown`, `provider`, `transport`,
-`control_plane`, or `unknown`), whether the stop was expected, the initiator,
-reason, and recording time. Recorded stop intent survives adapter completion.
+`control_plane`, `controller_lease`, or `unknown`), whether the stop was expected,
+the initiator, reason, and recording time. Recorded stop intent survives adapter
+completion. `controller_lease` means the host stopped its own legacy adapter
+after it lost the durable controller lease; the reason names a closed cause
+(`renewal_rejected`, `renewal_deadline`, or `renewal_error`).
 The local lifecycle event includes this evidence. Started cancellations without
 an expected stop are also reported to Sentry; its cancellation diagnostics contain
-only source, expectedness, and initiator type, never initiator IDs or reason text.
+only source, expectedness, initiator type, and the closed lease-loss cause, never
+initiator IDs or reason text.
 Historical ambiguous cancellations stay `unknown` and do not authorize replay.
 
 Provider tool-definition validation failures use
@@ -264,6 +347,14 @@ chat. Chat also omits the matching notice stored by older runners. Real provider
 warnings and errors remain visible.
 
 Recovery lifecycle events retain the original structured failure code, retry attempt, next retry time, and predecessor/successor identifiers. Durable status delivery uses an idempotency marker; delivery grants no provider authority. Failed publication is retried without repeating provider work. These records are not first-party Telemetry.
+
+An unstarted legacy conversation retry waiting for execution cleanup retains
+`resultJson.executionWait` with the issue, blocking run, and
+`execution_owner_active` cause. A local lifecycle event records the wait and the
+unchanged scheduled retry attempt once per blocking run. Repeated scheduler
+checks update the same retry row without repeating that event. Promotion removes
+this ownership-wait marker after cleanup; other execution holds retain their
+existing dispatch gates.
 
 If execution-continuation setup finds that a task no longer exists, is closed,
 or its owner changed, the existing cancellation settlement records
@@ -319,6 +410,23 @@ task emits its own diagnostic; nested repository failures are logged once by
 the enclosing workspace task. The original error and restore safety policy are
 unchanged. These lines stay in the instance run log and its configured durable
 storage, and are not new first-party telemetry events.
+
+Native sandbox `environmentSyncOut` errors preserve allowlisted error codes and
+bounded HTTP/exit statuses across worker RPC for this diagnostic line. The host
+revalidates the envelope and keeps the original failure and recovery policy.
+Provider messages, paths, response bodies, credentials, and arbitrary error data
+are not copied into the new envelope. Older workers can still report `unknown`.
+
+The optional `step` identifies the failed restore operation. For
+`phase=workspace` and `step=git_integration`, `gitCommand` identifies one fixed
+command family (`rev_parse`, `symbolic_ref`, `merge_base`, `merge_tree`,
+`commit_tree`, `update_ref`, or `log`). `gitFailureKind` is `merge_conflict`,
+`invalid_object`, `ref_conflict`, `permission_denied`, or `unknown`; it is a
+bounded diagnostic clue, not a new recovery or retry decision. Only supported
+exit/OS codes and recognized Git messages produce a specific classification.
+No command arguments, stderr, filenames, repository URLs, or ref names are saved.
+The same closed fields persist in `workspaceRestoreDiagnostic` and are
+revalidated before projection into an enabled Sentry failure report.
 
 ## Codex resume usage snapshot
 

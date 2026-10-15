@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
+import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const mockInstanceSettingsService = vi.hoisted(() => ({
   get: vi.fn(),
@@ -29,8 +30,10 @@ const mockCompanyService = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockPublishActivity = vi.hoisted(() => vi.fn());
+const mockReadIdleSleepSafety = vi.hoisted(() => vi.fn());
 
 function registerModuleMocks() {
+  vi.doMock("../services/idle-sleep-safety.js", () => ({ readIdleSleepSafety: mockReadIdleSleepSafety }));
   vi.doMock("../services/index.js", () => ({
     companyService: () => mockCompanyService,
     heartbeatService: () => mockHeartbeatService,
@@ -65,6 +68,15 @@ const mockDb = {
   select: vi.fn(() => ({ from: () => Promise.resolve(mockCompanyRows) })),
 };
 
+function localAdminActor() {
+  return {
+    type: "board",
+    userId: "local-board",
+    source: "local_implicit",
+    isInstanceAdmin: true,
+  };
+}
+
 describe("instance settings routes", () => {
   const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
     const [{ errorHandler }, { instanceSettingsRoutes }] = await Promise.all([
@@ -74,7 +86,7 @@ describe("instance settings routes", () => {
     return { errorHandler, instanceSettingsRoutes };
   });
 
-  function createApp(actor: any) {
+  function createApp(actor: any, pluginWorkers?: PluginWorkerManager, prepareBackup?: () => Promise<boolean>) {
     const { errorHandler, instanceSettingsRoutes } = routeModules.value;
     const app = express();
     app.use(express.json());
@@ -82,13 +94,14 @@ describe("instance settings routes", () => {
       req.actor = actor;
       next();
     });
-    app.use("/api", instanceSettingsRoutes(mockDb as any));
+    app.use("/api", instanceSettingsRoutes(mockDb as any, pluginWorkers, prepareBackup));
     app.use(errorHandler);
     return app;
   }
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockReadIdleSleepSafety.mockReset();
     // vi.clearAllMocks() clears recorded calls only; it does not remove a
     // mockImplementation a prior test installed. Reinstall the default here
     // so a stateful implementation from one test can never leak into the
@@ -230,12 +243,7 @@ describe("instance settings routes", () => {
   });
 
   it("allows local board users to read and update experimental settings", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     const getRes = await request(app).get("/api/instance/settings/experimental");
     expect(getRes.status).toBe(200);
@@ -269,12 +277,7 @@ describe("instance settings routes", () => {
   }, 10_000);
 
   it("does not expose the retired liveness auto-recovery endpoints", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     await request(app)
       .post("/api/instance/settings/experimental/issue-graph-liveness-auto-recovery/preview")
@@ -299,12 +302,7 @@ describe("instance settings routes", () => {
   });
 
   it("accepts the instance-wide Streamlined UI preference", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     await request(app)
       .patch("/api/instance/settings/experimental")
@@ -317,12 +315,7 @@ describe("instance settings routes", () => {
   });
 
   it("strips server-managed worktree run execution fields before updating experimental settings", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     await request(app)
       .patch("/api/instance/settings/experimental")
@@ -339,12 +332,7 @@ describe("instance settings routes", () => {
   });
 
   it("allows local board users to read and update the instance default environment", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     const getRes = await request(app).get("/api/instance/settings");
     expect(getRes.status).toBe(200);
@@ -375,12 +363,7 @@ describe("instance settings routes", () => {
       envVars: {},
       metadata: { managedByPaperclip: true, managedDefaultStamped: true },
     });
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     const patchRes = await request(app)
       .patch("/api/instance/settings")
@@ -415,12 +398,7 @@ describe("instance settings routes", () => {
       metadata: { managedByPaperclip: true, managedDefaultStamped: true },
     });
     mockEnvironmentService.update.mockRejectedValue(new Error("metadata write failed"));
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     const patchRes = await request(app)
       .patch("/api/instance/settings")
@@ -432,12 +410,7 @@ describe("instance settings routes", () => {
 
   it("rejects unknown defaultEnvironmentId values with 422", async () => {
     mockEnvironmentService.getById.mockResolvedValue(null);
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     const res = await request(app)
       .patch("/api/instance/settings")
@@ -449,12 +422,7 @@ describe("instance settings routes", () => {
   });
 
   it("allows local board users to update guarded dev-server auto-restart", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     await request(app)
       .patch("/api/instance/settings/experimental")
@@ -469,12 +437,7 @@ describe("instance settings routes", () => {
   });
 
   it("allows local board users to update external object detection", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     await request(app)
       .patch("/api/instance/settings/experimental")
@@ -487,12 +450,7 @@ describe("instance settings routes", () => {
   });
 
   it("allows local board users to update built-in agents", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     await request(app)
       .patch("/api/instance/settings/experimental")
@@ -505,12 +463,7 @@ describe("instance settings routes", () => {
   });
 
   it("allows local board users to update the goals sidebar link", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     await request(app)
       .patch("/api/instance/settings/experimental")
@@ -523,12 +476,7 @@ describe("instance settings routes", () => {
   });
 
   it("allows local board users to update the server info debug view", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     await request(app)
       .patch("/api/instance/settings/experimental")
@@ -541,12 +489,7 @@ describe("instance settings routes", () => {
   });
 
   it("allows local board users to update environment controls", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     await request(app)
       .patch("/api/instance/settings/experimental")
@@ -578,12 +521,7 @@ describe("instance settings routes", () => {
   });
 
   it("allows local board users to read and update general settings", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "local-board",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
+    const app = await createApp(localAdminActor());
 
     const getRes = await request(app).get("/api/instance/settings/general");
     expect(getRes.status).toBe(200);
@@ -960,6 +898,127 @@ describe("instance settings routes", () => {
 
       expect(res.status).toBe(200);
       expect(res.body).toEqual(idleStatus);
+      expect(mockReadIdleSleepSafety).not.toHaveBeenCalled();
+    });
+
+    it("acquires an owned bounded idle hold and forwards its owner for inspection", async () => {
+      const ownerId = "d0b833f4-4098-42de-8420-1907f3aa4895";
+      mockHeartbeatService.computeTaskDrain.mockReturnValue({ ownerId, startedAt: new Date(), expiresAt: new Date(Date.now() + 60_000) });
+      await request(createApp(adminActor)).post("/api/instance/task-drain").send({ purpose: "idle", ttlMs: 60_000 }).expect(200);
+      expect(mockHeartbeatService.computeTaskDrain).toHaveBeenCalledWith({ purpose: "idle", ttlMs: 60_000 });
+      await request(createApp(adminActor)).get(`/api/instance/task-drain?idleSleepSafety=1&ownerId=${ownerId}`).expect(200);
+      expect(mockReadIdleSleepSafety).toHaveBeenLastCalledWith(mockDb, expect.any(Function), Date.now, ownerId, expect.any(Function), undefined, undefined, false);
+    });
+
+    it.each([{}, { ttlMs: null }, { ttlMs: 1 }, { ttlMs: 300_001 }])("rejects an unbounded or invalid idle TTL: %j", async body => {
+      await request(createApp(adminActor)).post("/api/instance/task-drain").send({ ...body, purpose: "idle" }).expect(400);
+      expect(mockHeartbeatService.applyTaskDrain).not.toHaveBeenCalled();
+    });
+
+    it("rejects replacement and ownerless or stale release of an idle hold", async () => {
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue({ ...idleStatus, draining: true, ownerId: "current-owner" });
+      const app = createApp(adminActor);
+      await request(app).post("/api/instance/task-drain").send({}).expect(409);
+      await request(app).delete("/api/instance/task-drain").expect(409);
+      await request(app).delete("/api/instance/task-drain?ownerId=previous-owner").expect(409);
+      expect(mockHeartbeatService.applyTaskDrain).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.stopTaskDrain).not.toHaveBeenCalled();
+      await request(app).delete("/api/instance/task-drain?ownerId=current-owner").expect(200);
+      expect(mockHeartbeatService.stopTaskDrain).toHaveBeenCalledOnce();
+    });
+
+    it("returns the opt-in instance-wide safety report to an instance admin", async () => {
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);
+      const report = { version: 1, backgroundWork: "unknown" };
+      mockReadIdleSleepSafety.mockResolvedValue(report);
+      const res = await request(createApp(adminActor)).get("/api/instance/task-drain?idleSleepSafety=1");
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ ...idleStatus, idleSleepSafety: report });
+      expect(mockReadIdleSleepSafety).toHaveBeenCalledWith(mockDb, expect.any(Function), Date.now, undefined, expect.any(Function), undefined, undefined, false);
+      expect(mockReadIdleSleepSafety.mock.calls[0][1]()).toEqual(idleStatus);
+    });
+
+    it("reserves routine deadline reports for verified Cloud control callers", async () => {
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);
+      for (const source of ["session", "cloud_tenant", "local_implicit"]) {
+        await request(createApp({ ...adminActor, source }))
+          .get("/api/instance/task-drain?idleSleepSafety=1&scheduledWake=1&ownerId=fixture-owner").expect(403);
+      }
+      expect(mockReadIdleSleepSafety).not.toHaveBeenCalled();
+      await request(createApp({ ...adminActor, source: "cloud_control" }))
+        .get("/api/instance/task-drain?idleSleepSafety=1&scheduledWake=1&ownerId=fixture-owner").expect(200);
+      expect(mockReadIdleSleepSafety).toHaveBeenCalledWith(mockDb, expect.any(Function), Date.now,
+        "fixture-owner", expect.any(Function), undefined, undefined, true);
+    });
+
+    it("uses the live worker manager for inspection and releases only the owned hold", async () => {
+      const inspect = vi.fn(async () => ({ backgroundWork: "none", pluginIds: [] }));
+      const release = vi.fn();
+      const workers = {
+        inspectIdleSleep: inspect,
+        releaseIdleSleep: release,
+      } as unknown as PluginWorkerManager;
+      const ownerId = "fixture-idle-owner";
+      const lease = { ownerId, expiresAt: Date.now() + 60_000 };
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue({ ...idleStatus, draining: true, ownerId });
+      mockReadIdleSleepSafety.mockImplementation(async (_db, _status, _now, owner, _local, inspectPlugins) => {
+        expect(owner).toBe(ownerId);
+        return { version: 1, backgroundWork: (await inspectPlugins(lease)).backgroundWork };
+      });
+      const app = createApp(adminActor, workers);
+      await request(app).get(`/api/instance/task-drain?idleSleepSafety=1&ownerId=${ownerId}`).expect(200);
+      expect(inspect).toHaveBeenCalledWith(lease);
+      expect(inspect.mock.contexts[0]).toBe(workers);
+      await request(app).delete("/api/instance/task-drain?ownerId=stale-owner").expect(409);
+      expect(release).not.toHaveBeenCalled();
+      await request(app).delete(`/api/instance/task-drain?ownerId=${ownerId}`).expect(200);
+      expect(release).toHaveBeenCalledOnce();
+    });
+
+    it("passes the operator backup hook only through the protected safety report", async () => {
+      const backup = vi.fn(async () => true);
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);
+      const app = createApp(adminActor, undefined, backup);
+      await request(app).get("/api/instance/task-drain").expect(200);
+      expect(mockReadIdleSleepSafety).not.toHaveBeenCalled();
+      await request(app).get("/api/instance/task-drain?idleSleepSafety=1&ownerId=fixture-owner").expect(200);
+      expect(mockReadIdleSleepSafety).toHaveBeenCalledWith(mockDb, expect.any(Function), Date.now,
+        "fixture-owner", expect.any(Function), undefined, backup, false);
+      mockReadIdleSleepSafety.mockClear();
+      await request(createApp(nonAdminActor, undefined, backup)).get("/api/instance/task-drain?idleSleepSafety=1").expect(403);
+      expect(mockReadIdleSleepSafety).not.toHaveBeenCalled();
+      expect(backup).not.toHaveBeenCalled();
+    });
+
+    it("reserves managed checkpoint creation for verified Cloud control actors", async () => {
+      const backup = vi.fn(async () => true);
+      process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = "fixture-managed-signal";
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);
+      try {
+        for (const source of ["session", "cloud_tenant", "local_implicit"]) {
+          const tenantAdmin = createApp({ ...adminActor, source }, undefined, backup);
+          await request(tenantAdmin).get("/api/instance/task-drain?idleSleepSafety=1&ownerId=fixture-owner")
+            .set("x-paperclip-cloud-control", "unverified-header").expect(403);
+        }
+        expect(mockReadIdleSleepSafety).not.toHaveBeenCalled();
+        expect(backup).not.toHaveBeenCalled();
+        const control = createApp({ ...adminActor, source: "cloud_control" }, undefined, backup);
+        await request(control).get("/api/instance/task-drain?idleSleepSafety=1&ownerId=fixture-owner").expect(200);
+        expect(mockReadIdleSleepSafety).toHaveBeenCalledWith(mockDb, expect.any(Function), Date.now,
+          "fixture-owner", expect.any(Function), undefined, backup, false);
+      } finally {
+        delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      }
+    });
+
+    it.each([
+      ["company member", nonAdminActor],
+      ["agent", { type: "agent", agentId: "agent-1", companyId: "company-1" }],
+      ["anonymous caller", { type: "none" }],
+    ])("does not expose the instance-wide work report to a %s", async (_name, actor) => {
+      const res = await request(createApp(actor)).get("/api/instance/task-drain?idleSleepSafety=1");
+      expect(res.status).toBe(403);
+      expect(mockReadIdleSleepSafety).not.toHaveBeenCalled();
     });
 
     it("writes an activity record for every company, then applies the same drain values, in one transaction", async () => {

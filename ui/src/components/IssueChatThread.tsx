@@ -1,3 +1,6 @@
+import { resolveIssueChatHumanAuthor } from "@/lib/issue-chat-human-author";
+import { useWorkspaceBaseRefRecovery } from "./WorkspaceBaseRefRecovery";
+import { WorkspaceBaseRefRecoveryNotice } from "./WorkspaceBaseRefRecoveryNotice";
 import { DispositionRecoveryNotice, useDispositionRecoverySnapshot } from "./DispositionRecoveryNotice";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import type { ComposerRunSettings } from "./task-chat/composer-run-settings";
@@ -1163,30 +1166,7 @@ function formatInteractionActorLabel(args: {
   return "System";
 }
 
-export function resolveIssueChatHumanAuthor(args: {
-  authorName?: string | null;
-  authorUserId?: string | null;
-  currentUserId?: string | null;
-  userProfileMap?: ReadonlyMap<string, CompanyUserProfile> | null;
-}) {
-  const { authorName, authorUserId, currentUserId, userProfileMap } = args;
-  const profile = authorUserId
-    ? (userProfileMap?.get(authorUserId) ?? null)
-    : null;
-  const isCurrentUser = Boolean(
-    authorUserId && currentUserId && authorUserId === currentUserId,
-  );
-  const resolvedAuthorName =
-    profile?.label?.trim() ||
-    authorName?.trim() ||
-    (authorUserId === "local-board" ? "Board" : isCurrentUser ? "You" : "User");
-
-  return {
-    isCurrentUser,
-    authorName: resolvedAuthorName,
-    avatarUrl: profile?.image ?? null,
-  };
-}
+export { resolveIssueChatHumanAuthor } from "@/lib/issue-chat-human-author";
 
 function toolCountSummary(toolParts: ToolCallMessagePart[]): string | null {
   if (toolParts.length === 0) return null;
@@ -2507,6 +2487,7 @@ function IssueChatAssistantMessage({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
+          {custom.origin === "fast_response" && <div className="max-w-xs px-2 py-2 text-xs text-muted-foreground">Platform-generated acknowledgement. The agent’s substantive response follows separately.</div>}
           <DropdownMenuItem
             onClick={() => {
               void copyTextToClipboard(copyText).catch((error) => {
@@ -2659,19 +2640,18 @@ function IssueChatAssistantMessage({
               <span className="text-xs text-muted-foreground/60">
                 {chainOfThoughtLabel?.toLowerCase()}
               </span>
-              <span className="ml-auto flex items-center gap-1.5">
-                {message.createdAt ? (
-                  <span className="text-(length:--text-micro) text-muted-foreground/50">
-                    {commentDateLabel(message.createdAt)}
-                  </span>
-                ) : null}
-                <ChevronDown
-                  className={cn(
-                    "h-3.5 w-3.5 text-muted-foreground/40 transition-transform",
-                    !folded && "rotate-180",
-                  )}
-                />
-              </span>
+              <ChevronDown
+                aria-hidden="true"
+                className={cn(
+                  "h-3.5 w-3.5 shrink-0 text-muted-foreground/40 opacity-0 transition-[opacity,transform] group-hover:opacity-100 group-focus-visible:opacity-100",
+                  !folded && "rotate-180",
+                )}
+              />
+              {message.createdAt ? (
+                <span className="ml-auto text-(length:--text-micro) text-muted-foreground/50">
+                  {commentDateLabel(message.createdAt)}
+                </span>
+              ) : null}
             </button>
           ) : (
             <div className="mb-1.5 flex items-center gap-2">
@@ -3519,6 +3499,7 @@ function SystemNoticeCommentContent({
     ? custom.commentMetadata
     : null;
   const recoverySnapshot = useDispositionRecoverySnapshot(commentMetadata);
+  const branchRecovery = useWorkspaceBaseRefRecovery(commentMetadata);
   const runAgentId =
     typeof custom.runAgentId === "string" ? custom.runAgentId : null;
   const runId = typeof custom.runId === "string" ? custom.runId : null;
@@ -3614,6 +3595,8 @@ function SystemNoticeCommentContent({
         });
       });
   };
+
+  if (authorType === "system" && branchRecovery) return <div id={anchorId}><WorkspaceBaseRefRecoveryNotice key={`${branchRecovery.actionId}:${branchRecovery.runId}`} {...branchRecovery.props} /></div>;
 
   if (authorType === "system" && recoverySnapshot) {
     return <div id={anchorId}><DispositionRecoveryNotice snapshot={recoverySnapshot} createdAt={toValidIsoString(message.createdAt)} defaultExpanded={presentation?.detailsDefaultOpen} /></div>;
@@ -4780,6 +4763,12 @@ const IssueChatComposer = forwardRef<
   const dragDepthRef = useRef(0);
   const effectiveSuggestedAssigneeValue =
     suggestedAssigneeValue ?? currentAssigneeValue;
+  const manualAssigneeRef = useRef(false);
+  const assigneeDraftKeyRef = useRef(draftKey);
+  const selectAssignee = (value: string) => {
+    manualAssigneeRef.current = true;
+    setReassignTarget(value);
+  };
   const [reassignTarget, setReassignTarget] = useState(
     effectiveSuggestedAssigneeValue,
   );
@@ -4936,8 +4925,12 @@ const IssueChatComposer = forwardRef<
   }, [draftKey]);
 
   useEffect(() => {
-    setReassignTarget(effectiveSuggestedAssigneeValue);
-  }, [effectiveSuggestedAssigneeValue]);
+    if (assigneeDraftKeyRef.current !== draftKey) {
+      assigneeDraftKeyRef.current = draftKey;
+      manualAssigneeRef.current = false;
+    }
+    if (!manualAssigneeRef.current) setReassignTarget(effectiveSuggestedAssigneeValue);
+  }, [draftKey, effectiveSuggestedAssigneeValue]);
 
   useEffect(() => {
     setPendingWorkMode(resolvedIssueWorkMode);
@@ -5082,6 +5075,7 @@ const IssueChatComposer = forwardRef<
       setComposerAttachments((current) =>
         current.filter((item) => !submittedAttachmentKeys.has(item.id)),
       );
+      manualAssigneeRef.current = false;
       setReassignTarget(effectiveSuggestedAssigneeValue);
       setRunSettings(null);
     } catch (error) {
@@ -5623,7 +5617,7 @@ const IssueChatComposer = forwardRef<
             overrides={assigneeAdapterOverrides}
             settings={runSettings}
             onSettingsChange={setRunSettings}
-            onAssigneeChange={setReassignTarget}
+            onAssigneeChange={selectAssignee}
             triggerRef={reassignTriggerRef}
             renderAssigneeIdentity={(value) => {
               const selected = value.startsWith("agent:") ? agentMap.get(value.slice(6)) : null;
@@ -5639,7 +5633,7 @@ const IssueChatComposer = forwardRef<
             noneLabel="No responsible"
             searchPlaceholder="Search responsible..."
             emptyMessage="No responsible found."
-            onChange={setReassignTarget}
+            onChange={selectAssignee}
             className="h-8 text-xs"
             renderTriggerValue={(option) => {
               if (!option)

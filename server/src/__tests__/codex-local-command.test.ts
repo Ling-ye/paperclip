@@ -50,6 +50,7 @@ describe.skipIf(process.platform === "win32")("server local Codex command select
     try {
       await fs.writeFile(executable, `#!${process.execPath}
 require('node:fs').appendFileSync(process.env.PROBE_CAPTURE, JSON.stringify(process.argv.slice(2)) + '\\n');
+if (process.argv.includes('--version')) { console.log('codex-cli 0.160.0'); process.exit(0); }
 console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'hello'}}));
 console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:1}}));
 `, { mode: 0o755 });
@@ -63,7 +64,8 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_t
       });
       const calls = (await fs.readFile(capture, "utf8")).trim().split("\n").map(line => JSON.parse(line) as string[]);
       expect(result.checks).toContainEqual(expect.objectContaining({ code: "codex_hello_probe_passed" }));
-      expect(calls[0]).toContain("exec");
+      expect(calls[0]).toEqual(["--version"]);
+      expect(calls[1]).toContain("exec");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

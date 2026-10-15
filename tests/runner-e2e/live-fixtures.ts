@@ -1,6 +1,10 @@
+import { verifyInstalledDaytonaPlugin } from "./installed-daytona-plugin.js";
+import { NATIVE_COMPLETION_BUDGET_CENTS } from "./native-completion-defaults.js";
 import path from "node:path";
+import { installedReleaseDaytonaPlugin } from "./installed-release.js";
 import { isManagedHiringCase } from "./chat-cases.js";
 import { FixtureRegistry } from "./fixture-registry.js";
+import { isImmutableDaytonaImage } from "./catalog.js";
 import { TASK_TITLE_BUDGET_CENTS } from "./task-titles.js";
 import { stageGrokSubscriptionFixture } from "./grok-subscription-fixture.js";
 import type { RunnerApi } from "./api.js";
@@ -38,7 +42,7 @@ interface AgentRecord {
 interface ManagedAccountFixture {
   connectionId: string;
   binding: {
-    provider: "openai" | "anthropic";
+    provider: "openai" | "anthropic" | "openrouter";
     method: "api_key";
     mode: "responsible_user";
   };
@@ -60,6 +64,7 @@ export interface LiveFixtureValues {
   agent: AgentRecord;
   project?: ProjectRecord;
   aiConnection?: ManagedAccountFixture;
+  setupProbe?: { leaseId: string; durationMs: number; defaultRunner?: string };
 
   onboardingRuntime?: {
     mode: "production-wizard" | "post-onboarding-runtime-switch";
@@ -74,6 +79,18 @@ function value<T>(resolved: ReadonlyMap<string, unknown>, id: string): T {
   const result = resolved.get(id);
   if (!result) throw new Error(`Missing resolved fixture ${id}`);
   return result as T;
+}
+
+export function selectFixtureRuntimeLeases<T extends {
+  id: string; provider?: string | null; heartbeatRunId?: string | null; issueId?: string | null;
+}>(input: { leases: T[]; runIds: string[]; issueId?: string; setupProbeLeaseId?: string }): T[] {
+  const selectedRunIds = new Set(input.runIds);
+  const relevant = input.leases.filter(lease => lease.provider === "daytona" && (
+    lease.id === input.setupProbeLeaseId || selectedRunIds.size === 0
+    || (lease.heartbeatRunId && selectedRunIds.has(lease.heartbeatRunId))
+    || (input.issueId && lease.issueId === input.issueId)
+  ));
+  return relevant.length > 0 ? relevant : input.leases;
 }
 
 async function deleteDaytonaEnvironment(api: RunnerApi, environmentId: string) {
@@ -108,18 +125,20 @@ export async function setupLiveFixtures(input: {
 }): Promise<LiveFixtureValues> {
   const { api, execution } = input;
   const registry = new FixtureRegistry();
+  let setupProbe: LiveFixtureValues["setupProbe"];
 
   if (execution.environment.id === "daytona") {
     registry.register<PluginRecord>({
       id: "sandbox-provider",
       async setup() {
+        const installed = await verifyInstalledDaytonaPlugin(process.env, [execution]);
         return api.post<PluginRecord>("/api/plugins/install", {
-          packageName: path.resolve(
+          packageName: installed?.packageRoot ?? path.resolve(
             import.meta.dirname,
             "../../packages/plugins/sandbox-providers/daytona",
           ),
           isLocalPath: true,
-        });
+        }, { timeout: 120_000 });
       },
       async teardown() {
         // The plugin is installed only in the isolated instance/database. The
@@ -135,7 +154,10 @@ export async function setupLiveFixtures(input: {
       return api.post<CompanyRecord>("/api/companies", {
         name: `Runner E2E ${execution.id} ${input.executionNonce}`,
         description: "Ephemeral paid full-stack runner acceptance fixture",
-        budgetMonthlyCents: execution.suite.id === "task-titles" ? TASK_TITLE_BUDGET_CENTS : 0,
+        budgetMonthlyCents: ["native-completion", "native-instruction-consolidation", "native-connection-guidance"].includes(execution.suite.id)
+          || (execution.suite.id === "everyday-workflows" && ["hire-reuse", "delegate-feedback"].includes(execution.task.id)) ? NATIVE_COMPLETION_BUDGET_CENTS
+          : execution.suite.id === "task-titles" ? TASK_TITLE_BUDGET_CENTS
+          : ["stock-harness", "task-workspaces"].includes(execution.suite.id) ? 1_000 : 0,
       });
     },
     async teardown() {
@@ -241,10 +263,11 @@ export async function setupLiveFixtures(input: {
       dependencies: ["company"],
       async setup(resolved) {
         const company = value<CompanyRecord>(resolved, "company");
-        const provider =
-          execution.profile.provider === "acpx" ? "anthropic" : "openai";
-        const key =
-          provider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
+        const key = execution.profile.credential;
+        const provider = key === "ANTHROPIC_API_KEY" ? "anthropic"
+          : key === "OPENROUTER_API_KEY" ? "openrouter"
+          : key === "OPENAI_API_KEY" ? "openai" : null;
+        if (!provider) throw new Error(`Unsupported managed hiring credential ${key}`);
         const apiKey = input.credentials[key];
         if (!apiKey) throw new Error(`Missing credential ${key}`);
         const account = await api.postSensitive<{ connectionId: string }>(
@@ -287,6 +310,37 @@ export async function setupLiveFixtures(input: {
         secretRefs,
         executionId: input.executionNonce,
       });
+      const autoCodex = agent.adapterType === "codex_local" && (agent.runner === undefined || agent.runner === "auto");
+      const nativeCodex = agent.adapterType === "paperclip_runner" && (agent.adapterConfig as Record<string, unknown>).provider === "codex";
+      if (environment.driver === "sandbox" && execution.profile.generation === "native"
+        && execution.profile.provider === "codex" && agent.runner !== "legacy" && (autoCodex || nativeCodex)) {
+        if (!isImmutableDaytonaImage(String(environment.config?.image ?? "")) || environment.config?.snapshot) {
+          throw new Error("Native Codex qualification requires this fixture's immutable image-backed environment.");
+        }
+        const startedAt = Date.now();
+        const probe = await api.post<{ ok: boolean; details?: { platformQualificationRecorded?: boolean; leaseId?: string } }>(
+          `/api/environments/${environment.id}/probe?companyId=${encodeURIComponent(company.id)}`,
+          {}, { timeout: 330_000 },
+        );
+        if (probe.ok !== true || probe.details?.platformQualificationRecorded !== true || !probe.details.leaseId) {
+          throw new Error("Native Codex image qualification was not recorded; agent creation was not attempted.");
+        }
+        setupProbe = { leaseId: probe.details.leaseId, durationMs: Date.now() - startedAt };
+        if (autoCodex) {
+          const adapters = await api.get<Array<{ type: string; defaultRunner?: string; supportedRunners?: string[] }>>(
+            `/api/adapters?companyId=${encodeURIComponent(company.id)}&environmentId=${encodeURIComponent(environment.id)}`,
+          );
+          const selected = adapters.find(adapter => adapter.type === "codex_local");
+          if (selected?.defaultRunner !== "paperclip" || !selected.supportedRunners?.includes("paperclip")) {
+            throw new Error("The qualified image does not advertise native Codex as its server-owned default.");
+          }
+          setupProbe.defaultRunner = selected.defaultRunner;
+        }
+      }
+      if (["stock-harness", "native-connection-guidance"].includes(execution.suite.id)
+        || (execution.suite.id === "everyday-workflows" && ["hire-reuse", "delegate-feedback"].includes(execution.task.id))) {
+        agent.budgetMonthlyCents = 1_000;
+      }
       if (managedHiring) {
         const account = value<ManagedAccountFixture>(resolved, "ai-connection");
         const config = agent.adapterConfig as Record<string, unknown>;
@@ -307,7 +361,7 @@ export async function setupLiveFixtures(input: {
     },
   });
 
-  if (execution.environment.configurationKey === "warm-reuse-v1"
+  if (execution.task.flow === "warm_three_turn"
     || (execution.suite.id === "extended-harnesses" && execution.task.id === "file-edit-validate")) {
     registry.register<ProjectRecord>({
       id: "project",
@@ -350,6 +404,7 @@ export async function setupLiveFixtures(input: {
     secretRefs: value<SecretReferenceMap>(setup.values, "secrets"),
     environment: value<EnvironmentRecord>(setup.values, "environment"),
     agent: value<AgentRecord>(setup.values, "agent"),
+    ...(setupProbe ? { setupProbe } : {}),
     ...(setup.values.has("project")
       ? { project: value<ProjectRecord>(setup.values, "project") }
       : {}),

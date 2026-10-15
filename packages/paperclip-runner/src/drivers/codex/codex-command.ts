@@ -1,6 +1,8 @@
 import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { delimiter, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+
+/** Prefer the installed dependency; compatibility is established by the CLI protocol. */
 export function resolveCodexCommand(
   issuer: string | URL = import.meta.url,
   environment: NodeJS.ProcessEnv = process.env,
@@ -15,6 +17,7 @@ export function resolveCodexCommand(
         bridgeManifest = runnerRequire.resolve("@agentclientprotocol/codex-acp/package.json");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "MODULE_NOT_FOUND") throw error;
+        // pnpm can retain the bridge inside its declared adapter dependency.
         const adapter = runnerRequire.resolve("@paperclipai/adapter-codex-local/server");
         bridgeManifest = createRequire(adapter).resolve("@agentclientprotocol/codex-acp/package.json");
       }
@@ -57,6 +60,7 @@ function resolveCodexOnPath(environment: NodeJS.ProcessEnv, workingDirectory: st
   const names = process.platform === "win32"
     ? ["codex", ...(environment.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map(extension => `codex${extension.toLowerCase()}`)]
     : ["codex"];
+  // Empty PATH components mean cwd; an omitted PATH has no search entries.
   for (const directory of environment.PATH === undefined ? [] : environment.PATH.split(delimiter)) {
     for (const name of names) {
       try {
@@ -64,9 +68,11 @@ function resolveCodexOnPath(environment: NodeJS.ProcessEnv, workingDirectory: st
         if (!statSync(executable).isFile()) continue;
         accessSync(executable, constants.X_OK);
         return executable;
-      } catch {}
+      } catch { /* Continue looking for an executable in the selected host PATH. */ }
     }
   }
   throw new Error("No installed Codex dependency or executable on PATH");
 }
+
+// Compatibility export: the release pin is not a runtime version gate.
 export const resolvePinnedCodexCommand = resolveCodexCommand;

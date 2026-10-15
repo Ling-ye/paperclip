@@ -54,3 +54,63 @@ is safe to remove from its age, an absent PID, or a successful task response.
 
 This change prevents new orphaned ownership. It cannot recover file changes
 that an earlier failed collection discarded.
+
+## Required remote restore failures
+
+The copy-back first repairs itself. While the run still holds its merge
+baseline, a workspace copy-back that fails before writing any host file is
+retried up to three times in total, with a short backoff. This covers dropped
+transfers, provider errors, and a merge lock held by another restore. An unsafe
+archive, a permission failure, or any failure after the merge started writing
+host files is never retried. Only a copy-back that still fails reaches the
+repair hold below. Adapter environment Tests restore into a throwaway temp
+workspace, so they opt out of these retries and report a failure at once.
+
+When a legacy sandbox run cannot copy required workspace files back, the server
+keeps the original allocation for repair. It writes the failed run, the exact
+lease retention intent, and a board-owned repair hold in one transaction. The
+hold survives reassignment and conversation resets and coexists with newer
+recovery incidents; it never supersedes them.
+Cleanup stops that allocation and verifies its provider receipt. It does not
+use ordinary ephemeral destruction or return the source to warm reuse. Stop
+failures use the existing cleanup retry and backoff policy.
+
+The retained source uses `retain_on_failure`. A stopped source can still incur
+provider storage charges. It stays available until an operator recovers or
+explicitly discards it; elapsed time never proves that its files were copied.
+The task's `GET /api/issues/:id/recovery-actions` response lists these repair holds
+alongside any newer active incident, including the original lease IDs. Inspect
+those exact leases through `GET /api/environment-leases/:leaseId`,
+confirm that cleanup stopped them, recover the missing files, and record
+`workspaceRepairEvidence` through the existing recovery-action resolution API.
+Send `POST /api/issues/:id/recovery-actions/resolve` with the exact recovery action
+ID, `outcome: "restored"`, the task's **unchanged**
+`sourceIssueStatus`, and `executionReconciliation` for the recorded source run.
+Only a board operator can record this repair. It preserves the current task
+owner, conversation generation, status, and execution locks. It does not queue a
+continuation or replay the stopped run; after repair, any new work still follows
+the normal admission rules.
+The original legacy run may be `succeeded` while required files still need
+repair. Verified file-only repair accepts that terminal result and keeps it
+unchanged. It still requires the retained-source record, exact remote stop
+receipts, and recovered-file evidence. A successful result does not permit a
+normal execution retry, and a queued or running source cannot be repaired this
+way. Later saved messages can continue through ordinary admission after the
+file hold clears.
+The board shows repair guidance, an Inspect run link, and a Record file recovery
+form for operators with runtime access. The form requires recovered-file evidence
+and confirmation; the API verifies the original stop receipts. The operator API
+also supports this workflow and returns the exact action and lease IDs. Provider
+access may require an instance administrator or Cloud support.
+Then use the provider's operator console to remove that exact retained
+allocation when its files are no longer needed. Verify its immutable provider
+allocation ID against the recorded lease before removal. The ordinary reusable
+sandbox cleanup does not select `retain_on_failure` sources; do not use
+environment deletion as proof that this allocation was removed. Keep the
+environment and its provider credentials until recovery is complete. Recording a
+repair decision does not automatically destroy it.
+
+A new message, Retry, or `/new` cannot clear this workspace repair hold. Ordinary
+local lock-timeout retries and runs without a required remote copy-back failure
+keep their existing policy. This change preserves future failures; it cannot
+recover files from an allocation that was already destroyed.

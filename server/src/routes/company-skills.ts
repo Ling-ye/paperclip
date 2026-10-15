@@ -1,13 +1,16 @@
+import { projectSkillSetupIdentity } from "../services/project-skill-source-bindings.js";
+import { adoptProjectSkillRepository, projectSkillRepositories, skillSourceSyncService } from "../services/skill-source-sync.js";
+import { skillAccessRequestContext, skillAccessService } from "../services/skill-access.js";
 import { skillSourceService, type SkillSourceContext } from "../services/skill-sources.js";
 import { skillSourceGitHubReader } from "../services/skill-source-github-access.js";
 import { toolAccessService } from "../services/tool-access.js";
-import { skillSourceCreateSchema, skillSourceDiscoverySchema, skillSourcePreviewSchema, skillSourceSelectionSchema } from "@paperclipai/shared";
+import { skillSourceCreateSchema, skillSourceDiscoverySchema, skillSourcePreviewSchema, skillSourceSelectionSchema, skillSourceSettingsSchema, projectSkillSourceAdoptSchema, skillSourceDisconnectSchema } from "@paperclipai/shared";
 import type { ActivityPublication } from "../services/activity-log.js";
 import { once } from "node:events";
 import type { SkillSourceDiscoveryEvent } from "@paperclipai/shared";
 import { createHash } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { activityLog } from "@paperclipai/db";
+import { activityLog, companySkills } from "@paperclipai/db";
 import { persistActivity, publishActivity } from "../services/activity-log.js";
 import { projectToolContext } from "../services/project-tool-context.js";
 import { Router, type Request } from "express";
@@ -52,7 +55,7 @@ import {
   listCatalogSkillsOrEmpty,
   readCatalogSkillFile,
 } from "../services/skills-catalog.js";
-import { badRequest, conflict, forbidden, unauthorized, HttpError } from "../errors.js";
+import { badRequest, conflict, forbidden, unauthorized, notFound, HttpError } from "../errors.js";
 import { assertAuthenticated, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { getTelemetryClient } from "../telemetry.js";
 import {
@@ -60,7 +63,7 @@ import {
   normalizeSkillPolicySourceType,
   type SkillPolicyPrincipal,
 } from "../services/company-skill-policy.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
+import { authorizationDeniedDetails, type AuthorizationActor } from "../services/authorization.js";
 import {
   normalizeSkillPolicySourceLocator,
   type SkillPolicyAction,
@@ -97,9 +100,23 @@ type SkillPolicyResourceInput =
 
 export function companySkillRoutes(db: Db) {
   const router = Router();
+  router.use(skillAccessRequestContext);
+  router.param("skillId", async (req, _res, next, id) => {
+    try {
+      if (req.actor.type === "none") throw unauthorized("Authentication required");
+      assertCompanyAccess(req, String(req.params.companyId));
+      if (!await svc.getById(String(req.params.companyId), id)) throw notFound("Skill not found");
+      next();
+    } catch (error) { next(error); }
+  });
+  router.param("sourceId", async (req, _res, next, id) => {
+    try { assertCompanyAccess(req, String(req.params.companyId)); await skillAccessService(db).assertSource(String(req.params.companyId), id); next(); }
+    catch (error) { next(error); }
+  });
   const access = accessService(db);
   const svc = companySkillService(db);
   const sourceSvc = skillSourceService(db);
+  const sourceSync = skillSourceSyncService(db);
   const issues = issueService(db);
   const heartbeat = heartbeatService(db);
   const skillPolicies = companySkillPolicyService(db);
@@ -300,8 +317,10 @@ export function companySkillRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
     const actor = getActorInfo(req);
     const publications: ActivityPublication[] = [];
+    const setup = await projectSkillSetupIdentity(db, companyId, req.actor);
     const result = await operation({
       actor: skillActor(req),
+      setup: { userId: setup.refreshUserId, agentId: setup.refreshAgentId, localTrusted: setup.refreshLocalTrusted },
       read: connectionId => skillSourceGitHubReader(db, companyId, req.actor, connectionId),
       authorize: (action, resource) => assertCanMutateCompanySkills(req, companyId, action, resource),
       audit: async (tx, sourceId, action, details) => {
@@ -313,6 +332,21 @@ export function companySkillRoutes(db: Db) {
     return result;
   }
 
+  router.get("/companies/:companyId/skill-sources/project-repositories", async (req, res) => {
+    const companyId = String(req.params.companyId);
+    assertCompanyAccess(req, companyId);
+    res.json(await projectSkillRepositories(db, companyId, req.actor));
+  });
+  router.post("/companies/:companyId/skill-sources/adopt-project", validate(projectSkillSourceAdoptSchema), async (req, res) => {
+    const companyId = String(req.params.companyId);
+    const result = await sourceOperation(req, companyId, context => adoptProjectSkillRepository(db, companyId, req.body.workspaceId, context.authorize));
+    publishActivity(result.publication);
+    res.status(202).json({ bindingId: result.bindingId });
+  });
+  router.patch("/companies/:companyId/skill-sources/:sourceId/settings", validate(skillSourceSettingsSchema), async (req, res) => {
+    const companyId = String(req.params.companyId);
+    res.json(await sourceOperation(req, companyId, context => sourceSvc.settings(companyId, String(req.params.sourceId), req.body, context)));
+  });
   router.get("/companies/:companyId/skill-sources/repositories", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -388,11 +422,14 @@ export function companySkillRoutes(db: Db) {
   });
   router.post("/companies/:companyId/skill-sources/:sourceId/refresh", async (req, res) => {
     const companyId = req.params.companyId as string;
-    res.json(await sourceOperation(req, companyId, context => sourceSvc.refresh(companyId, req.params.sourceId as string, context)));
+    res.json(await sourceOperation(req, companyId, context => sourceSync.refreshSource(companyId, req.params.sourceId as string, context)));
   });
-  router.delete("/companies/:companyId/skill-sources/:sourceId", async (req, res) => {
+  router.delete("/companies/:companyId/skill-sources/:sourceId", (req, _res, next) => {
+    assertCompanyAccess(req, req.params.companyId as string);
+    next();
+  }, validate(skillSourceDisconnectSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
-    res.json(await sourceOperation(req, companyId, context => sourceSvc.disconnect(companyId, req.params.sourceId as string, context)));
+    res.json(await sourceOperation(req, companyId, context => sourceSvc.disconnect(companyId, req.params.sourceId as string, context, req.body)));
   });
 
   router.get("/skills/catalog", async (req, res) => {
@@ -699,10 +736,22 @@ export function companySkillRoutes(db: Db) {
         assigneeAgentId: req.body.agentId,
       });
       const actor = getActorInfo(req);
+      const skill = await svc.getById(companyId, skillId);
+      let skillProjectId: string | undefined;
+      if (skill?.accessSourceId) {
+        const bindings = await skillAccessService(db).projectIds(companyId, skill.accessSourceId);
+        const testActor: AuthorizationActor = { type: "agent", agentId: req.body.agentId, companyId, source: "agent_key",
+          onBehalfOfUserId: req.actor.source === "local_implicit" ? null : req.actor.userId ?? req.actor.onBehalfOfUserId };
+        for (const binding of bindings) {
+          if ((await access.decide({ actor: testActor, action: "project:read", resource: { type: "project", companyId, projectId: binding.projectId } })).allowed) { skillProjectId = binding.projectId; break; }
+        }
+        if (!skillProjectId) throw forbidden("Choose an agent with access to this skill's project.");
+      }
       const result = await svc.createTestRun(companyId, skillId, req.body, skillActor(req), {
         createHarnessIssue: async (harnessIssue) => {
           const created = await issues.create(companyId, {
             ...harnessIssue,
+            ...(skillProjectId ? { projectId: skillProjectId, visibility: "private" as const } : {}),
             priority: "medium",
             createdByAgentId: actor.agentId,
             createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -1219,13 +1268,66 @@ export function companySkillRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const skillId = req.params.skillId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.edit", () => skillPolicyResource({ companyId, skillId }));
+      const { idempotencyKey, expectedVersionId, ...input } = req.body;
+      if (idempotencyKey) {
+        const actor = getActorInfo(req);
+        const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
+          ? await projectToolContext(db, req.actor, true, "Skill") : null;
+        const receiptKey = `skill-file:${companyId}:${actor.actorId}:${runContext?.issue.id ?? "board"}:${skillId}:${idempotencyKey}`;
+        const fingerprint = createHash("sha256").update(JSON.stringify({ ...input, expectedVersionId })).digest("hex");
+        const rollbackState: { current: { restore: () => Promise<void>; versionId: string | null } | null } = { current: null };
+        const outcome = await db.transaction(async tx => {
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${receiptKey}, 0))`);
+          if (runContext) await projectToolContext(tx as unknown as Db, req.actor, true, "Skill");
+          const [prior] = await tx.select().from(activityLog).where(and(
+            eq(activityLog.companyId, companyId), eq(activityLog.action, "company.skill_file_updated"),
+            sql`${activityLog.details}->>'idempotencyKey' = ${receiptKey}`,
+          ));
+          if (prior) {
+            if (prior.details?.fingerprint !== fingerprint) throw conflict("Skill file idempotency key was used with different inputs");
+            return { receipt: prior.details?.receipt, publication: null };
+          }
+          let publication: ActivityPublication | null = null;
+          let receipt: { skillId: string; path: string; versionId: string | null; studioPath: string } | null = null;
+          await companySkillService(tx as unknown as Db).updateFile(companyId, skillId, input.path, input.content, skillActor(req), {
+            encoding: input.encoding, executable: input.executable, expectedVersionId,
+            onRollback: (restore, versionId) => { rollbackState.current = { restore, versionId }; },
+            afterUpdate: async (versionId) => {
+              receipt = { skillId, path: input.path, versionId, studioPath: `/skills/studio/${encodeURIComponent(skillId)}` };
+              const activity = await persistActivity(tx as unknown as Db, {
+                companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId,
+                runId: actor.runId, agentApiKeyId: actor.agentApiKeyId, issueId: runContext?.issue.id,
+                action: "company.skill_file_updated", entityType: "company_skill", entityId: skillId,
+                details: { path: input.path, markdown: input.path === "SKILL.md", versionId,
+                  sourceIssueId: runContext?.issue.id ?? null, idempotencyKey: receiptKey, fingerprint, receipt },
+              });
+              publication = activity.publication;
+            },
+          });
+          return { receipt, publication };
+        }).catch(async (error) => {
+          if (rollbackState.current) {
+            const { restore, versionId } = rollbackState.current;
+            await db.transaction(async tx => {
+              await tx.execute(sql`select ${companySkills.id} from ${companySkills} where ${companySkills.id} = ${skillId} and ${companySkills.companyId} = ${companyId} for update`);
+              const [current] = await tx.select({ versionId: companySkills.currentVersionId }).from(companySkills)
+                .where(and(eq(companySkills.id, skillId), eq(companySkills.companyId, companyId)));
+              if (current && current.versionId === versionId) await restore();
+            });
+          }
+          throw error;
+        });
+        if (outcome.publication) publishActivity(outcome.publication);
+        res.json(outcome.receipt);
+        return;
+      }
       const result = await svc.updateFile(
         companyId,
         skillId,
         String(req.body.path ?? ""),
         String(req.body.content ?? ""),
         skillActor(req),
-        { encoding: req.body.encoding, executable: req.body.executable },
+        { encoding: req.body.encoding, executable: req.body.executable, expectedVersionId },
       );
 
       const actor = getActorInfo(req);

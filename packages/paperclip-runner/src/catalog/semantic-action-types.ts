@@ -2,6 +2,7 @@ export type PaperclipSemanticActionId =
   | "search_api"
   | "call_api"
   | "set_task_title"
+  | "set_task_monitor"
   | "get_task_context"
   | "get_task_history"
   | "list_documents"
@@ -27,6 +28,11 @@ export type PaperclipSemanticActionId =
   | "reassign_task"
   | "set_dependencies"
   | "create_skill"
+  | "update_skill"
+  | "get_workspace"
+  | "list_workspaces"
+  | "select_workspace"
+  | "prepare_repository"
   | "create_project"
   | "list_project_repositories"
   | "list_projects"
@@ -59,6 +65,7 @@ export interface PaperclipJsonSchema {
   readonly additionalProperties?: boolean | PaperclipJsonSchema;
   readonly items?: PaperclipJsonSchema;
   readonly enum?: readonly PaperclipJsonValue[];
+  readonly const?: PaperclipJsonValue;
   readonly oneOf?: readonly PaperclipJsonSchema[];
   readonly anyOf?: readonly PaperclipJsonSchema[];
   readonly minimum?: number;
